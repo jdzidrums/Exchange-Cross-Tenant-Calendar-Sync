@@ -1,0 +1,158 @@
+name: Cross-Tenant Calendar Sync CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Deploy to both M365 tenants and Azure Automation
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: calendar-sync-production
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  validate:
+    name: Validate PowerShell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Scope CurrentUser -Force -Repository PSGallery
+      - name: Parse and analyze PowerShell
+        shell: pwsh
+        run: ./scripts/Validate-Repository.ps1
+
+  deploy-dzidrums:
+    name: Deploy Dzidrums Exchange RBAC
+    needs: validate
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == true) ||
+      (github.event_name == 'push' && vars.CALENDAR_SYNC_CICD_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Login to Dzidrums with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.DZIDRUMS_DEPLOYER_CLIENT_ID }}
+          tenant-id: ${{ vars.DZIDRUMS_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Deploy mailbox-scoped Exchange RBAC
+        shell: pwsh
+        run: |
+          ./scripts/Deploy-ExchangeTenant.ps1 `
+            -TenantName 'Dzidrums' `
+            -Organization '${{ vars.DZIDRUMS_ORGANIZATION }}' `
+            -Mailbox '${{ vars.DZIDRUMS_MAILBOX }}' `
+            -RuntimeClientId '${{ vars.DZIDRUMS_RUNTIME_CLIENT_ID }}' `
+            -RuntimeServicePrincipalObjectId '${{ vars.DZIDRUMS_RUNTIME_SP_OBJECT_ID }}'
+
+  deploy-ultrapro:
+    name: Deploy Ultra PRO Exchange RBAC
+    needs: validate
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.deploy == true) ||
+      (github.event_name == 'push' && vars.CALENDAR_SYNC_CICD_ENABLED == 'true')
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Login to Ultra PRO with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.ULTRAPRO_DEPLOYER_CLIENT_ID }}
+          tenant-id: ${{ vars.ULTRAPRO_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Deploy mailbox-scoped Exchange RBAC
+        shell: pwsh
+        run: |
+          ./scripts/Deploy-ExchangeTenant.ps1 `
+            -TenantName 'Ultra PRO' `
+            -Organization '${{ vars.ULTRAPRO_ORGANIZATION }}' `
+            -Mailbox '${{ vars.ULTRAPRO_MAILBOX }}' `
+            -RuntimeClientId '${{ vars.ULTRAPRO_RUNTIME_CLIENT_ID }}' `
+            -RuntimeServicePrincipalObjectId '${{ vars.ULTRAPRO_RUNTIME_SP_OBJECT_ID }}'
+
+  deploy-azure:
+    name: Publish Azure Automation runbook
+    needs: [validate, deploy-dzidrums, deploy-ultrapro]
+    if: >-
+      always() && needs.validate.result == 'success' &&
+      needs.deploy-dzidrums.result == 'success' &&
+      needs.deploy-ultrapro.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Login to Azure with GitHub OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_DEPLOYER_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+      - name: Publish runbook and schedules
+        shell: pwsh
+        run: |
+          $respectPrivate = [System.Convert]::ToBoolean('${{ vars.SYNC_RESPECT_PRIVATE }}')
+          $copyReminders = [System.Convert]::ToBoolean('${{ vars.SYNC_COPY_REMINDERS }}')
+          ./scripts/Deploy-AzureAutomation.ps1 `
+            -SubscriptionId '${{ vars.AZURE_SUBSCRIPTION_ID }}' `
+            -ResourceGroupName '${{ vars.AZURE_RESOURCE_GROUP }}' `
+            -Location '${{ vars.AZURE_LOCATION }}' `
+            -AutomationAccountName '${{ vars.AUTOMATION_ACCOUNT_NAME }}' `
+            -RuntimeEnvironmentName '${{ vars.AUTOMATION_RUNTIME_ENVIRONMENT }}' `
+            -RunbookName '${{ vars.AUTOMATION_RUNBOOK_NAME }}' `
+            -RunbookFile './AzureAutomation-CrossTenantCalendarSync.ps1' `
+            -KeyVaultName '${{ vars.KEY_VAULT_NAME }}' `
+            -StateStorageAccount '${{ vars.STATE_STORAGE_ACCOUNT }}' `
+            -DzidrumsSecretName '${{ vars.DZIDRUMS_SECRET_NAME }}' `
+            -UltraProSecretName '${{ vars.ULTRAPRO_SECRET_NAME }}' `
+            -DzidrumsTenantId '${{ vars.DZIDRUMS_TENANT_ID }}' `
+            -DzidrumsClientId '${{ vars.DZIDRUMS_RUNTIME_CLIENT_ID }}' `
+            -DzidrumsMailbox '${{ vars.DZIDRUMS_MAILBOX }}' `
+            -UltraProTenantId '${{ vars.ULTRAPRO_TENANT_ID }}' `
+            -UltraProClientId '${{ vars.ULTRAPRO_RUNTIME_CLIENT_ID }}' `
+            -UltraProMailbox '${{ vars.ULTRAPRO_MAILBOX }}' `
+            -DetailMode '${{ vars.SYNC_DETAIL_MODE }}' `
+            -RespectPrivate $respectPrivate `
+            -CopyReminders $copyReminders `
+            -PastDays ([int]'${{ vars.SYNC_PAST_DAYS }}') `
+            -FutureDays ([int]'${{ vars.SYNC_FUTURE_DAYS }}') `
+            -RebaselineDays ([int]'${{ vars.SYNC_REBASELINE_DAYS }}')

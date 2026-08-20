@@ -1,0 +1,42 @@
+{
+  "GeneratedUtc": "<generated-by-installer>",
+  "Azure": {
+    "SubscriptionId": "<subscription-guid>",
+    "ResourceGroupName": "rg-crosscalendar-prod",
+    "Location": "westus2",
+    "AutomationAccountName": "aa-crosscalendar-prod",
+    "AutomationPrincipalId": "<managed-identity-object-guid>",
+    "RuntimeEnvironmentName": "CalendarSync_PS74",
+    "RunbookName": "CrossTenantCalendarSync",
+    "KeyVaultName": "kv-calsync-xxxxxxxxxx",
+    "StorageAccountName": "stcalsyncxxxxxxxxxx",
+    "StateContainer": "calendar-sync",
+    "StateBlob": "calendar-sync-state.json",
+    "LockBlob": "calendar-sync.lock",
+    "EffectiveSchedule": "Every 5 minutes via 12 staggered hourly schedules"
+  },
+  "Dzidrums": {
+    "TenantId": "<dzidrums-tenant-guid>",
+    "ClientId": "<dzidrums-runtime-app-id>",
+    "ServicePrincipalObjectId": "<dzidrums-runtime-service-principal-object-id>",
+    "Mailbox": "joey@dzidrums.com",
+    "KeyVaultSecretName": "dzidrums-calendar-sync-client-secret",
+    "SecretExpiresUtc": "<expiration>"
+  },
+  "UltraPro": {
+    "TenantId": "<ultrapro-tenant-guid>",
+    "ClientId": "<ultrapro-runtime-app-id>",
+    "ServicePrincipalObjectId": "<ultrapro-runtime-service-principal-object-id>",
+    "Mailbox": "jdzidrums@ultrapro.com",
+    "KeyVaultSecretName": "ultrapro-calendar-sync-client-secret",
+    "SecretExpiresUtc": "<expiration>"
+  },
+  "Sync": {
+    "DetailMode": "BusyOnly",
+    "RespectPrivate": true,
+    "CopyReminders": false,
+    "PastDays": 30,
+    "FutureDays": 365,
+    "RebaselineDays": 1
+  }
+}
