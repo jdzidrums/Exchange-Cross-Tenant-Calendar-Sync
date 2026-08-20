@@ -1,0 +1,13 @@
+AzureCalendarSync.DeploymentSummary.json
+GitHubActions.EnvironmentVariables.json
+*.state.json
+*.log
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+.vscode/
+.idea/
+.DS_Store
