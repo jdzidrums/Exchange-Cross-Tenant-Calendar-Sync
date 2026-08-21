@@ -97,7 +97,13 @@ function Write-Log {
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     # Keep diagnostics off the success pipeline so functions that log while
     # returning data cannot accidentally turn their result into an array.
-    Write-Host "[$stamp] [$Level] $Message"
+    $line = "[$stamp] [$Level] $Message"
+    if ($Level -eq 'WARN') {
+        Write-Warning $line
+    }
+    else {
+        Write-Verbose $line -Verbose
+    }
 }
 
 function Get-ExceptionStatusCode {
