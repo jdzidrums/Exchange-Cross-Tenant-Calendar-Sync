@@ -93,7 +93,9 @@ function Connect-CalendarSyncGraph {
         $params.ClientTimeout = 600
     }
 
-    Connect-MgGraph @params
+    # Device-code instructions are emitted to the success stream. Send them to
+    # the host so callers can capture only the Graph context returned below.
+    Connect-MgGraph @params | Out-Host
     $ctx = Get-MgContext
     if (-not $ctx -or [string]::IsNullOrWhiteSpace([string]$ctx.TenantId)) {
         throw "Microsoft Graph authentication did not establish a usable context for $FriendlyName."
