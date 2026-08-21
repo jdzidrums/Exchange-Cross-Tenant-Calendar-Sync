@@ -56,6 +56,28 @@ foreach ($file in $files) {
                 })
             }
         }
+
+        $unsafeTransactionIdAccess = @($ast.FindAll({
+            param($node)
+            if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
+            if ([string]$node.Member.Value -ne 'transactionId') { return $false }
+
+            # Assigning transactionId on the outbound event payload is safe.
+            $parent = $node.Parent
+            return -not (
+                $parent -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $parent.Left -eq $node
+            )
+        }, $true))
+        if ($unsafeTransactionIdAccess.Count -gt 0) {
+            foreach ($unsafeAccess in $unsafeTransactionIdAccess) {
+                $errors.Add([pscustomobject]@{
+                    File = $file.FullName
+                    Message = 'Optional Graph transactionId values must be read through Get-EventTransactionId.'
+                    Extent = $unsafeAccess.Extent.Text
+                })
+            }
+        }
     }
 }
 

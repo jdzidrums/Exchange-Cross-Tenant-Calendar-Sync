@@ -551,7 +551,7 @@ function Get-MirrorIndex {
 
         $response = Invoke-Graph -Token $Token -Method GET -Uri $uri
         foreach ($event in @($response.value)) {
-            $tx = [string]$event.transactionId
+            $tx = Get-EventTransactionId -Event $event
             if (-not [string]::IsNullOrWhiteSpace($tx) -and $tx.StartsWith($script:SyncTagPrefix)) {
                 if (-not $index.ContainsKey($tx)) {
                     $index[$tx] = [string]$event.id
@@ -580,10 +580,21 @@ function Get-DeterministicTransactionId {
     "$script:SyncTagPrefix$($hex.Substring(0,32))"
 }
 
+function Get-EventTransactionId {
+    param([Parameter(Mandatory)]$Event)
+
+    # Graph omits optional event properties instead of returning them as null.
+    # Access the property bag so StrictMode does not fail on ordinary events
+    # that do not have a client-supplied transactionId.
+    $property = $Event.PSObject.Properties['transactionId']
+    if ($property) { return [string]$property.Value }
+    return ''
+}
+
 function Test-IsMirrorEvent {
     param([Parameter(Mandatory)]$Event)
 
-    $tx = [string]$Event.transactionId
+    $tx = Get-EventTransactionId -Event $Event
     return (-not [string]::IsNullOrWhiteSpace($tx) -and $tx.StartsWith($script:SyncTagPrefix))
 }
 
