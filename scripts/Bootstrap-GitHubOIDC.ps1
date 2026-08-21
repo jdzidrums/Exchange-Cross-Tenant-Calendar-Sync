@@ -47,10 +47,6 @@ foreach ($module in @(
     Ensure-Module -Name $module
 }
 
-Import-Module Microsoft.Graph.Authentication
-Import-Module Az.Accounts
-Import-Module Az.Resources
-
 $summaryPath = [System.IO.Path]::GetFullPath($DeploymentSummaryPath)
 if (-not (Test-Path $summaryPath)) { throw "Deployment summary not found: $summaryPath" }
 $summary = Get-Content -Path $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 50
@@ -59,6 +55,53 @@ $subject = "repo:$GitHubOwner@$GitHubOwnerId/$GitHubRepository@$GitHubRepository
 $issuer = 'https://token.actions.githubusercontent.com'
 $audience = 'api://AzureADTokenExchange'
 Write-Host "GitHub OIDC subject: $subject"
+
+function Invoke-IsolatedAzureBootstrap {
+    param(
+        [Parameter(Mandatory)][string]$SummaryPath,
+        [string]$TenantId,
+        [string]$ServicePrincipalObjectId
+    )
+
+    # Microsoft.Graph.Authentication and Az.Accounts currently ship
+    # incompatible Azure.Identity versions. Run Az commands in a child pwsh
+    # process so either module can use the dependency version it was built for.
+    $helperPath = Join-Path $PSScriptRoot 'Bootstrap-GitHubOIDC.Azure.ps1'
+    if (-not (Test-Path $helperPath)) { throw "Azure OIDC helper not found: $helperPath" }
+
+    $contextPath = Join-Path ([System.IO.Path]::GetTempPath()) "calendar-sync-azure-context-$([guid]::NewGuid().ToString('N')).json"
+    $processArgs = @(
+        '-NoLogo'
+        '-NoProfile'
+        '-File'
+        $helperPath
+        '-DeploymentSummaryPath'
+        $SummaryPath
+        '-ContextOutputPath'
+        $contextPath
+    )
+    if (-not [string]::IsNullOrWhiteSpace($TenantId)) {
+        $processArgs += @('-AzureTenantId', $TenantId)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ServicePrincipalObjectId)) {
+        $processArgs += @('-AzureServicePrincipalObjectId', $ServicePrincipalObjectId)
+    }
+
+    try {
+        $pwshPath = (Get-Command pwsh -ErrorAction Stop).Source
+        & $pwshPath @processArgs | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Isolated Azure OIDC bootstrap failed with exit code $LASTEXITCODE."
+        }
+        if (-not (Test-Path $contextPath)) {
+            throw 'Isolated Azure OIDC bootstrap did not return its Azure context.'
+        }
+        return Get-Content -Path $contextPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    }
+    finally {
+        Remove-Item -Path $contextPath -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Connect-CalendarSyncGraph {
     param(
@@ -283,23 +326,15 @@ function New-M365GitHubDeployer {
     }
 }
 
+$azureContext = Invoke-IsolatedAzureBootstrap `
+    -SummaryPath $summaryPath `
+    -TenantId $AzureTenantId
+$AzureTenantId = [string]$azureContext.AzureTenantId
+
+Import-Module Microsoft.Graph.Authentication
+
 $dz = New-M365GitHubDeployer -TenantId ([string]$summary.Dzidrums.TenantId) -FriendlyName 'Dzidrums'
 $up = New-M365GitHubDeployer -TenantId ([string]$summary.UltraPro.TenantId) -FriendlyName 'Ultra PRO'
-
-Write-Host '`nAzure sign-in required for the subscription that hosts the Automation account.' -ForegroundColor Yellow
-$currentAz = Get-AzContext -ErrorAction SilentlyContinue
-if (-not $currentAz -or [string]$currentAz.Subscription.Id -ne [string]$summary.Azure.SubscriptionId) {
-    $azParams = @{
-        Subscription          = [string]$summary.Azure.SubscriptionId
-        UseDeviceAuthentication = $true
-        ErrorAction           = 'Stop'
-    }
-    if ($AzureTenantId) { $azParams.Tenant = $AzureTenantId }
-    Connect-AzAccount @azParams | Out-Null
-}
-Set-AzContext -SubscriptionId ([string]$summary.Azure.SubscriptionId) | Out-Null
-$azContext = Get-AzContext
-$AzureTenantId = [string]$azContext.Tenant.Id
 
 Connect-CalendarSyncGraph `
     -TenantId $AzureTenantId `
@@ -314,19 +349,10 @@ finally {
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 }
 
-$automationScope = "/subscriptions/$($summary.Azure.SubscriptionId)/resourceGroups/$($summary.Azure.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($summary.Azure.AutomationAccountName)"
-$role = Get-AzRoleAssignment `
-    -ObjectId ([string]$azureSp.id) `
-    -RoleDefinitionName 'Automation Contributor' `
-    -Scope $automationScope `
-    -ErrorAction SilentlyContinue
-if (-not $role) {
-    New-AzRoleAssignment `
-        -ObjectId ([string]$azureSp.id) `
-        -RoleDefinitionName 'Automation Contributor' `
-        -Scope $automationScope | Out-Null
-    Write-Host "Granted Automation Contributor at $automationScope"
-}
+Invoke-IsolatedAzureBootstrap `
+    -SummaryPath $summaryPath `
+    -TenantId $AzureTenantId `
+    -ServicePrincipalObjectId ([string]$azureSp.id) | Out-Null
 
 function Resolve-RuntimeServicePrincipalId {
     param(
