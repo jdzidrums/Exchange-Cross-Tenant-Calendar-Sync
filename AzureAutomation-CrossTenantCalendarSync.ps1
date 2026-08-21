@@ -88,6 +88,7 @@ $script:StorageTokenExpiresUtc = [datetime]::MinValue
 $script:KeyVaultToken = $null
 $script:KeyVaultTokenExpiresUtc = [datetime]::MinValue
 $script:StateWasNew = $false
+$script:PendingWarnings = [System.Collections.Generic.List[string]]::new()
 
 function Write-Log {
     param(
@@ -103,6 +104,18 @@ function Write-Log {
     else {
         Write-Output $line
     }
+}
+
+function Add-PendingWarning {
+    param([Parameter(Mandatory)][string]$Message)
+    [void]$script:PendingWarnings.Add($Message)
+}
+
+function Write-PendingWarnings {
+    foreach ($message in @($script:PendingWarnings)) {
+        Write-Log -Message $message -Level 'WARN'
+    }
+    $script:PendingWarnings.Clear()
 }
 
 function Get-ExceptionStatusCode {
@@ -399,16 +412,25 @@ function Invoke-Graph {
         [Parameter(Mandatory)][ValidateSet('GET','POST','PATCH','DELETE')][string]$Method,
         [Parameter(Mandatory)][string]$Uri,
         [object]$Body,
-        [int]$MaxAttempts = 6
+        [int]$MaxAttempts = 10
     )
 
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         Renew-StorageLeaseIfNeeded
 
+        # Calendar delta responses can be expensive after a large batch of
+        # changes. Ask Graph for bounded pages, then reduce the page size on
+        # retries so a transient gateway timeout does not repeatedly request
+        # the same large response.
+        $pageSize = [Math]::Max(5, [int][Math]::Floor(50 / [Math]::Pow(2, $attempt - 1)))
+        $preferences = [System.Collections.Generic.List[string]]::new()
+        $preferences.Add('IdType="ImmutableId"')
+        if ($Method -eq 'GET') { $preferences.Add("odata.maxpagesize=$pageSize") }
+
         $headers = @{
             Authorization = "Bearer $Token"
             Accept        = 'application/json'
-            Prefer        = 'IdType="ImmutableId"'
+            Prefer        = ($preferences -join ', ')
         }
 
         try {
@@ -434,8 +456,7 @@ function Invoke-Graph {
             }
 
             $delay = [Math]::Min([Math]::Pow(2, $attempt), 30)
-            $warningStamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-            Write-Warning "[$warningStamp] [WARN] Graph returned HTTP $status; retrying with backoff."
+            Add-PendingWarning "Graph returned HTTP $status; retrying with page size $pageSize after backoff."
             Renew-StorageLeaseIfNeeded
             Start-Sleep -Seconds $delay
         }
@@ -953,6 +974,7 @@ try {
         )) {
             $mailbox = [Uri]::EscapeDataString([string]$test.Mailbox)
             $calendar = Invoke-Graph -Token $test.Token -Method GET -Uri "https://graph.microsoft.com/v1.0/users/$mailbox/calendar?`$select=id,name"
+            Write-PendingWarnings
             Write-Log "$($test.Name) calendar authorization is valid for $($test.Mailbox)."
         }
         Write-Log 'TEST PASSED.'
@@ -980,6 +1002,7 @@ try {
         -SourceToken $dzToken `
         -DestinationToken $upToken `
         -ForceBaseline $forceBaseline
+    Write-PendingWarnings
 
     Invoke-OneDirection `
         -DirectionName 'Ultra PRO -> Dzidrums' `
@@ -991,9 +1014,14 @@ try {
         -SourceToken $upToken `
         -DestinationToken $dzToken `
         -ForceBaseline $forceBaseline
+    Write-PendingWarnings
 
     Set-State -State $state
     Write-Log 'Synchronization completed successfully and state was persisted to Azure Blob Storage.'
+}
+catch {
+    Write-PendingWarnings
+    throw
 }
 finally {
     Release-StorageLease

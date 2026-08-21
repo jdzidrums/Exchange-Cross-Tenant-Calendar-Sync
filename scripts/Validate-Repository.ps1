@@ -39,22 +39,34 @@ foreach ($file in $files) {
                 param($node)
                 $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
             }, $true)
-            $nestedLogs = if ($dataFunction) {
+            $streamWrites = if ($dataFunction) {
                 @($dataFunction.Body.FindAll({
                     param($node)
-                    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Log'
+                    $node -is [System.Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -in @(
+                        'Write-Log','Write-Warning','Write-Output','Write-Information',
+                        'Write-Host','Write-Error','Write-Debug','Write-Verbose'
+                    )
                 }, $true))
             }
             else {
                 @()
             }
-            if (-not $dataFunction -or @($nestedLogs).Count -gt 0) {
+            if (-not $dataFunction -or @($streamWrites).Count -gt 0) {
                 $errors.Add([pscustomobject]@{
                     File = $file.FullName
-                    Message = "$functionName must not log to the success pipeline while returning data."
+                    Message = "$functionName must not emit stream records while returning data or holding sensitive parameters."
                     Extent = $functionName
                 })
             }
+        }
+
+        if ($file.FullName -and -not $ast.Extent.Text.Contains('odata.maxpagesize=')) {
+            $errors.Add([pscustomobject]@{
+                File = $file.FullName
+                Message = 'Microsoft Graph GET requests must request bounded page sizes.'
+                Extent = 'Invoke-Graph'
+            })
         }
 
         $unsafeTransactionIdAccess = @($ast.FindAll({
