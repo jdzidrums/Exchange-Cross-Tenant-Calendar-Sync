@@ -95,7 +95,9 @@ function Write-Log {
     )
 
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    Write-Output "[$stamp] [$Level] $Message"
+    # Keep diagnostics off the success pipeline so functions that log while
+    # returning data cannot accidentally turn their result into an array.
+    Write-Host "[$stamp] [$Level] $Message"
 }
 
 function Get-ExceptionStatusCode {
