@@ -111,7 +111,7 @@ function Wait-ForArmProvisioning {
 $api = '2024-10-23'
 $base = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.Automation/automationAccounts/$AutomationAccountName"
 
-$runtimeUri = "$base/runtimeEnvironments/$RuntimeEnvironmentName?api-version=$api"
+$runtimeUri = "$base/runtimeEnvironments/${RuntimeEnvironmentName}?api-version=$api"
 $runtimeBody = @{
     name = $RuntimeEnvironmentName
     properties = @{
@@ -123,7 +123,7 @@ Invoke-ArmRest -Method PUT -Uri $runtimeUri -Body $runtimeBody | Out-Null
 Wait-ForArmProvisioning -Uri $runtimeUri | Out-Null
 Write-Host "Runtime Environment ready: $RuntimeEnvironmentName"
 
-$runbookUri = "$base/runbooks/$RunbookName?api-version=$api"
+$runbookUri = "$base/runbooks/${RunbookName}?api-version=$api"
 $runbookBody = @{
     name = $RunbookName
     location = $Location
@@ -141,11 +141,11 @@ $runbookBody = @{
 Invoke-ArmRest -Method PUT -Uri $runbookUri -Body $runbookBody | Out-Null
 Wait-ForArmProvisioning -Uri $runbookUri | Out-Null
 
-$contentUri = "$base/runbooks/$RunbookName/draft/content?api-version=$api"
+$contentUri = "$base/runbooks/${RunbookName}/draft/content?api-version=$api"
 $content = Get-Content -Path $RunbookFile -Raw -Encoding UTF8
 Invoke-ArmRest -Method PUT -Uri $contentUri -Body $content -ContentType 'text/plain' | Out-Null
 
-$publishUri = "$base/runbooks/$RunbookName/publish?api-version=$api"
+$publishUri = "$base/runbooks/${RunbookName}/publish?api-version=$api"
 $accepted = $false
 for ($attempt = 1; $attempt -le 12 -and -not $accepted; $attempt++) {
     Start-Sleep -Seconds 5
@@ -246,7 +246,6 @@ if (-not $SkipSchedules) {
 
         Write-Host "Scheduled $name hourly starting $($start.ToString('u'))"
     }
-
 }
 else {
     Write-Host 'Schedule creation skipped; runbook remains published.'

@@ -61,6 +61,11 @@ if (-not $existing) {
 }
 
 function Set-VaultSecretWithRetry {
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText',
+        '',
+        Justification = 'Microsoft Graph returns newly generated client secrets as plaintext, while Set-AzKeyVaultSecret requires a SecureString.'
+    )]
     param([string]$Name, [string]$Value)
     $secure = ConvertTo-SecureString -String $Value -AsPlainText -Force
     for ($i = 1; $i -le 30; $i++) {

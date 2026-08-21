@@ -9,6 +9,11 @@
   tenant. Client secrets are written directly to Key Vault. The script then
   publishes the runbook by calling scripts/Deploy-AzureAutomation.ps1.
 
+  Interactive Microsoft Graph authentication uses device-code flow with an
+  extended timeout. Graph bootstrap operations use Invoke-MgGraphRequest rather
+  than generated Microsoft.Graph.Applications cmdlets to avoid cross-version
+  authentication-provider issues on macOS.
+
   After this one-time bootstrap, run scripts/Bootstrap-GitHubOIDC.ps1 and let
   GitHub Actions handle ongoing Exchange RBAC and runbook deployments.
 #>
@@ -41,6 +46,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+function Write-Step {
+    param([Parameter(Mandatory)][string]$Text)
+    Write-Host "`n=== $Text ===" -ForegroundColor Cyan
+}
+
 function Ensure-Module {
     param([Parameter(Mandatory)][string]$Name)
     if (-not (Get-Module -ListAvailable -Name $Name | Select-Object -First 1)) {
@@ -50,9 +60,10 @@ function Ensure-Module {
 
 foreach ($module in @(
     'Az.Accounts','Az.Resources','Az.Automation','Az.KeyVault','Az.Storage',
-    'Microsoft.Graph.Authentication','Microsoft.Graph.Applications',
-    'ExchangeOnlineManagement'
-)) { Ensure-Module $module }
+    'Microsoft.Graph.Authentication','ExchangeOnlineManagement'
+)) {
+    Ensure-Module $module
+}
 
 Import-Module Az.Accounts
 Import-Module Az.Resources
@@ -60,7 +71,6 @@ Import-Module Az.Automation
 Import-Module Az.KeyVault
 Import-Module Az.Storage
 Import-Module Microsoft.Graph.Authentication
-Import-Module Microsoft.Graph.Applications
 Import-Module ExchangeOnlineManagement
 
 function Get-StableSuffix {
@@ -71,15 +81,42 @@ function Get-StableSuffix {
     ([Convert]::ToHexString($hash).ToLowerInvariant()).Substring(0,10)
 }
 
+function Ensure-ResourceProvider {
+    param([Parameter(Mandatory)][string]$ProviderNamespace)
+
+    $providers = @(Get-AzResourceProvider -ProviderNamespace $ProviderNamespace -ErrorAction SilentlyContinue)
+    if (-not ($providers | Where-Object { $_.RegistrationState -eq 'Registered' })) {
+        Write-Host "Registering Azure resource provider $ProviderNamespace..."
+        Register-AzResourceProvider -ProviderNamespace $ProviderNamespace | Out-Null
+        for ($attempt = 1; $attempt -le 60; $attempt++) {
+            Start-Sleep -Seconds 3
+            $providers = @(Get-AzResourceProvider -ProviderNamespace $ProviderNamespace -ErrorAction SilentlyContinue)
+            if ($providers | Where-Object { $_.RegistrationState -eq 'Registered' }) { return }
+        }
+        throw "Azure resource provider $ProviderNamespace did not reach Registered state."
+    }
+}
+
 function Ensure-RoleAssignment {
-    param([string]$ObjectId,[string]$Role,[string]$Scope)
+    param(
+        [Parameter(Mandatory)][string]$ObjectId,
+        [Parameter(Mandatory)][string]$Role,
+        [Parameter(Mandatory)][string]$Scope
+    )
+
     $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $Role -Scope $Scope -ErrorAction SilentlyContinue
     if (-not $existing) {
         New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionName $Role -Scope $Scope | Out-Null
+        Write-Host "Assigned '$Role' at $Scope"
     }
 }
 
 function Set-KeyVaultSecretWithRetry {
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText',
+        '',
+        Justification = 'Microsoft Graph returns newly generated client secrets as plaintext, while Set-AzKeyVaultSecret requires a SecureString.'
+    )]
     param(
         [Parameter(Mandatory)][string]$VaultName,
         [Parameter(Mandatory)][string]$Name,
@@ -89,7 +126,7 @@ function Set-KeyVaultSecretWithRetry {
     $secureValue = ConvertTo-SecureString -String $Value -AsPlainText -Force
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         try {
-            Set-AzKeyVaultSecret -VaultName $VaultName -Name $Name -SecretValue $secureValue | Out-Null
+            Set-AzKeyVaultSecret -VaultName $VaultName -Name $Name -SecretValue $secureValue -ErrorAction Stop | Out-Null
             return
         }
         catch {
@@ -100,6 +137,85 @@ function Set-KeyVaultSecretWithRetry {
     }
 }
 
+function Connect-CalendarSyncGraph {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string[]]$Scopes,
+        [Parameter(Mandatory)][string]$FriendlyName
+    )
+
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+    Write-Host "`nMicrosoft Graph sign-in required for $FriendlyName ($TenantId)." -ForegroundColor Yellow
+    Write-Host 'When the device code appears, open https://microsoft.com/devicelogin immediately and complete sign-in.' -ForegroundColor Yellow
+
+    $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
+    $connectParams = @{
+        TenantId     = $TenantId
+        Scopes       = $Scopes
+        ContextScope = 'Process'
+        NoWelcome    = $true
+        ErrorAction  = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
+        $connectParams.UseDeviceCode = $true
+    }
+    elseif ($connectCommand.Parameters.ContainsKey('UseDeviceAuthentication')) {
+        $connectParams.UseDeviceAuthentication = $true
+    }
+    else {
+        throw 'Installed Microsoft.Graph.Authentication does not support device-code authentication. Update the module and retry.'
+    }
+    if ($connectCommand.Parameters.ContainsKey('ClientTimeout')) {
+        $connectParams.ClientTimeout = 600
+    }
+
+    Connect-MgGraph @connectParams
+    $ctx = Get-MgContext
+    if (-not $ctx -or [string]::IsNullOrWhiteSpace([string]$ctx.TenantId)) {
+        throw "Microsoft Graph authentication did not establish a usable context for $FriendlyName."
+    }
+
+    Write-Host "Microsoft Graph authenticated: $($ctx.Account) / tenant $($ctx.TenantId)"
+    return $ctx
+}
+
+function Get-GraphCollection {
+    param(
+        [Parameter(Mandatory)][string]$Resource,
+        [Parameter(Mandatory)][string]$Filter,
+        [string]$Select
+    )
+
+    $encodedFilter = [Uri]::EscapeDataString($Filter)
+    $uri = "https://graph.microsoft.com/v1.0/${Resource}?`$filter=$encodedFilter"
+    if ($Select) {
+        $uri += "&`$select=$([Uri]::EscapeDataString($Select))"
+    }
+    $response = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+    return @($response.value)
+}
+
+function Connect-CalendarSyncExchange {
+    param(
+        [Parameter(Mandatory)][string]$AdminUpn,
+        [Parameter(Mandatory)][string]$TenantHint
+    )
+
+    $connectCommand = Get-Command Connect-ExchangeOnline -ErrorAction Stop
+    $params = @{
+        UserPrincipalName = $AdminUpn
+        ShowBanner        = $false
+        ErrorAction       = 'Stop'
+    }
+    if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+        $params.DisableWAM = $true
+    }
+
+    Write-Host "Connecting to Exchange Online for $TenantHint as $AdminUpn..."
+    Connect-ExchangeOnline @params
+}
+
 function New-RuntimeApp {
     param(
         [Parameter(Mandatory)][string]$TenantHint,
@@ -107,123 +223,259 @@ function New-RuntimeApp {
         [Parameter(Mandatory)][string]$FriendlyName
     )
 
-    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
-    Connect-MgGraph -TenantId $TenantHint -Scopes 'Application.ReadWrite.All','Application.Read.All' -NoWelcome
-    $ctx = Get-MgContext
+    $ctx = Connect-CalendarSyncGraph `
+        -TenantId $TenantHint `
+        -Scopes @('Application.ReadWrite.All','Application.Read.All') `
+        -FriendlyName $FriendlyName
 
+    $exchangeConnected = $false
     try {
         $displayName = "CrossTenant Calendar Sync Runtime - $FriendlyName - $Mailbox"
-        $escaped = $displayName.Replace("'","''")
-        $apps = @(Get-MgApplication -Filter "displayName eq '$escaped'" -All)
-        if ($apps.Count -gt 1) { throw "Multiple app registrations named '$displayName' exist." }
-        $app = if ($apps.Count -eq 1) { $apps[0] } else { New-MgApplication -DisplayName $displayName -SignInAudience 'AzureADMyOrg' }
-
-        $sps = @(Get-MgServicePrincipal -Filter "appId eq '$($app.AppId)'" -All)
-        if ($sps.Count -gt 1) { throw "Multiple service principals exist for $($app.AppId)." }
-        $sp = if ($sps.Count -eq 1) { $sps[0] } else { New-MgServicePrincipal -AppId $app.AppId }
-
-        # Fail closed if a tenant-wide Graph Calendars.* application role exists.
-        $graph = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -All) | Select-Object -First 1
-        $assignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -All -ErrorAction SilentlyContinue)
-        $bad = foreach ($assignment in $assignments) {
-            if ([string]$assignment.ResourceId -ne [string]$graph.Id) { continue }
-            $role = @($graph.AppRoles | Where-Object { [string]$_.Id -eq [string]$assignment.AppRoleId }) | Select-Object -First 1
-            if ($role -and [string]$role.Value -like 'Calendars.*') { [string]$role.Value }
-        }
-        if (@($bad).Count -gt 0) {
-            throw "Runtime app $($app.AppId) has unscoped Graph calendar permission(s): $(@($bad) -join ', ')."
+        $escapedDisplayName = $displayName.Replace("'", "''")
+        $apps = @(Get-GraphCollection -Resource 'applications' -Filter "displayName eq '$escapedDisplayName'")
+        if ($apps.Count -gt 1) {
+            throw "Multiple app registrations named '$displayName' exist. Remove duplicates before continuing."
         }
 
-        $secret = Add-MgApplicationPassword -ApplicationId $app.Id -PasswordCredential @{
-            displayName = "Calendar sync $(Get-Date -Format yyyy-MM-dd)"
-            endDateTime = (Get-Date).ToUniversalTime().AddMonths($SecretLifetimeMonths)
+        if ($apps.Count -eq 1) {
+            $app = $apps[0]
+            Write-Host "Using existing runtime app: $($app.appId)"
         }
-        if (-not $secret.SecretText) { throw "Failed to create runtime credential for $FriendlyName." }
+        else {
+            $app = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/applications' -Body @{
+                displayName    = $displayName
+                signInAudience = 'AzureADMyOrg'
+            } -ErrorAction Stop
+            Write-Host "Created runtime app: $($app.appId)"
+        }
+
+        $sps = @(Get-GraphCollection -Resource 'servicePrincipals' -Filter "appId eq '$($app.appId)'")
+        if ($sps.Count -gt 1) { throw "Multiple service principals exist for appId $($app.appId)." }
+        if ($sps.Count -eq 1) {
+            $sp = $sps[0]
+        }
+        else {
+            $sp = Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body @{
+                appId = [string]$app.appId
+            } -ErrorAction Stop
+            Write-Host "Created runtime service principal: $($sp.id)"
+        }
+
+        # Fail closed if this runtime app has any tenant-wide Microsoft Graph
+        # Calendars.* application role. Such a grant would override the intended
+        # mailbox-only Exchange Application RBAC boundary.
+        $graphSps = @(Get-GraphCollection -Resource 'servicePrincipals' -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -Select 'id,appRoles')
+        $graphSp = $graphSps | Select-Object -First 1
+        if (-not $graphSp) { throw 'Microsoft Graph service principal was not found in the tenant.' }
+
+        $assignmentResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$($sp.id)/appRoleAssignments" -ErrorAction Stop
+        $badPermissions = foreach ($assignment in @($assignmentResponse.value)) {
+            if ([string]$assignment.resourceId -ne [string]$graphSp.id) { continue }
+            $role = @($graphSp.appRoles | Where-Object { [string]$_.id -eq [string]$assignment.appRoleId }) | Select-Object -First 1
+            if ($role -and [string]$role.value -like 'Calendars.*') { [string]$role.value }
+        }
+        if (@($badPermissions).Count -gt 0) {
+            throw "Runtime app $($app.appId) has unscoped Microsoft Graph calendar permission(s): $(@($badPermissions) -join ', '). Remove them before continuing."
+        }
 
         $exoAdmin = Read-Host "Exchange administrator UPN for $TenantHint"
-        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-        Connect-ExchangeOnline -UserPrincipalName $exoAdmin -ShowBanner:$false
-        try {
-            $mailboxObject = Get-Mailbox -Identity $Mailbox -ErrorAction Stop
-            $scopeName = "CalendarSync-$($Mailbox.Replace('@','-at-').Replace('.','-'))"
-            $assignmentName = "$scopeName-CalendarsRW"
-            $escapedDn = $mailboxObject.DistinguishedName.Replace("'","''")
-            $filter = "DistinguishedName -eq '$escapedDn'"
+        if ([string]::IsNullOrWhiteSpace($exoAdmin)) { throw 'Exchange administrator UPN is required.' }
 
-            if (Get-ManagementScope -Identity $scopeName -ErrorAction SilentlyContinue) {
-                Set-ManagementScope -Identity $scopeName -RecipientRestrictionFilter $filter
-            } else {
-                New-ManagementScope -Name $scopeName -RecipientRestrictionFilter $filter | Out-Null
-            }
+        Connect-CalendarSyncExchange -AdminUpn $exoAdmin -TenantHint $TenantHint
+        $exchangeConnected = $true
 
-            if (-not (Get-ServicePrincipal -Identity $sp.Id -ErrorAction SilentlyContinue)) {
-                New-ServicePrincipal -AppId $app.AppId -ObjectId $sp.Id -DisplayName $displayName | Out-Null
-            }
+        $mailboxObject = Get-Mailbox -Identity $Mailbox -ErrorAction Stop
+        $scopeName = "CalendarSync-$($Mailbox.Replace('@','-at-').Replace('.','-'))"
+        $assignmentName = "$scopeName-CalendarsRW"
+        $escapedDn = $mailboxObject.DistinguishedName.Replace("'", "''")
+        $recipientFilter = "DistinguishedName -eq '$escapedDn'"
 
-            if (Get-ManagementRoleAssignment -Identity $assignmentName -ErrorAction SilentlyContinue) {
-                Set-ManagementRoleAssignment -Identity $assignmentName -CustomResourceScope $scopeName
-            } else {
-                New-ManagementRoleAssignment -Name $assignmentName -Role 'Application Calendars.ReadWrite' -App $sp.Id -CustomResourceScope $scopeName | Out-Null
-            }
+        $scope = Get-ManagementScope -Identity $scopeName -ErrorAction SilentlyContinue
+        if ($scope) {
+            Set-ManagementScope -Identity $scopeName -RecipientRestrictionFilter $recipientFilter -ErrorAction Stop
+        }
+        else {
+            New-ManagementScope -Name $scopeName -RecipientRestrictionFilter $recipientFilter -ErrorAction Stop | Out-Null
+        }
 
-            $test = @(Test-ServicePrincipalAuthorization -Identity $sp.Id -Resource $Mailbox)
-            if (-not ($test | Where-Object { $_.RoleName -eq 'Application Calendars.ReadWrite' -and $_.InScope -eq $true })) {
-                throw "Mailbox-scoped Exchange authorization failed for $Mailbox."
+        $exoSp = Get-ServicePrincipal -Identity ([string]$sp.id) -ErrorAction SilentlyContinue
+        if (-not $exoSp) {
+            $created = $false
+            for ($attempt = 1; $attempt -le 12 -and -not $created; $attempt++) {
+                try {
+                    New-ServicePrincipal `
+                        -AppId ([string]$app.appId) `
+                        -ObjectId ([string]$sp.id) `
+                        -DisplayName $displayName `
+                        -ErrorAction Stop | Out-Null
+                    $created = $true
+                }
+                catch {
+                    if ($attempt -eq 12) { throw }
+                    Write-Host 'Waiting for the Entra service principal to propagate to Exchange Online...'
+                    Start-Sleep -Seconds 5
+                }
             }
         }
-        finally { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null }
 
-        [pscustomobject]@{
-            TenantId = [string]$ctx.TenantId
-            ClientId = [string]$app.AppId
-            ApplicationObjectId = [string]$app.Id
-            ServicePrincipalObjectId = [string]$sp.Id
-            Mailbox = $Mailbox
-            Secret = [string]$secret.SecretText
-            SecretKeyId = [string]$secret.KeyId
-            SecretExpiresUtc = $secret.EndDateTime.ToUniversalTime().ToString('o')
-            ExchangeScopeName = $scopeName
-            ExchangeAssignmentName = $assignmentName
+        $roleAssignment = Get-ManagementRoleAssignment -Identity $assignmentName -ErrorAction SilentlyContinue
+        if ($roleAssignment) {
+            Set-ManagementRoleAssignment -Identity $assignmentName -CustomResourceScope $scopeName -ErrorAction Stop
+        }
+        else {
+            New-ManagementRoleAssignment `
+                -Name $assignmentName `
+                -Role 'Application Calendars.ReadWrite' `
+                -App ([string]$sp.id) `
+                -CustomResourceScope $scopeName `
+                -ErrorAction Stop | Out-Null
+        }
+
+        $authorization = @(Test-ServicePrincipalAuthorization -Identity ([string]$sp.id) -Resource $Mailbox -ErrorAction Stop)
+        if (-not ($authorization | Where-Object { $_.RoleName -eq 'Application Calendars.ReadWrite' -and $_.InScope -eq $true })) {
+            throw "Mailbox-scoped Exchange authorization failed for $Mailbox."
+        }
+        Write-Host "Exchange mailbox-scoped authorization PASSED for $Mailbox."
+
+        # Create the runtime credential only after Exchange scoping succeeds.
+        $secretExpiry = [datetime]::UtcNow.AddMonths($SecretLifetimeMonths)
+        $passwordResult = Invoke-MgGraphRequest `
+            -Method POST `
+            -Uri "https://graph.microsoft.com/v1.0/applications/$($app.id)/addPassword" `
+            -Body @{
+                passwordCredential = @{
+                    displayName = "Calendar sync $(Get-Date -Format yyyy-MM-dd)"
+                    endDateTime = $secretExpiry.ToString('o')
+                }
+            } `
+            -ErrorAction Stop
+
+        if ([string]::IsNullOrWhiteSpace([string]$passwordResult.secretText)) {
+            throw "Runtime client-secret creation failed for $FriendlyName."
+        }
+
+        return [pscustomobject]@{
+            TenantId                 = [string]$ctx.TenantId
+            ClientId                 = [string]$app.appId
+            ApplicationObjectId      = [string]$app.id
+            ServicePrincipalObjectId = [string]$sp.id
+            Mailbox                  = $Mailbox
+            Secret                   = [string]$passwordResult.secretText
+            SecretKeyId              = [string]$passwordResult.keyId
+            SecretExpiresUtc         = $secretExpiry.ToString('o')
+            ExchangeScopeName        = $scopeName
+            ExchangeAssignmentName   = $assignmentName
         }
     }
     finally {
+        if ($exchangeConnected) {
+            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        }
         Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
     }
 }
 
-if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount | Out-Null }
+Write-Step 'Connecting to Azure'
+if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+    Connect-AzAccount -UseDeviceAuthentication | Out-Null
+}
 Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
+
+foreach ($provider in @('Microsoft.Automation','Microsoft.KeyVault','Microsoft.Storage')) {
+    Ensure-ResourceProvider -ProviderNamespace $provider
+}
 
 $suffix = Get-StableSuffix "$SubscriptionId|$ResourceGroupName|$AutomationAccountName"
 if (-not $KeyVaultName) { $KeyVaultName = "kv-calsync-$suffix" }
 if (-not $StorageAccountName) { $StorageAccountName = "stcalsync$suffix" }
 
+Write-Step 'Creating or reusing Azure resources'
 $rg = Get-AzResourceGroup -Name $ResourceGroupName -ErrorAction SilentlyContinue
-if (-not $rg) { $rg = New-AzResourceGroup -Name $ResourceGroupName -Location $Location }
+if (-not $rg) {
+    $rg = New-AzResourceGroup -Name $ResourceGroupName -Location $Location
+}
 
 $vault = Get-AzKeyVault -VaultName $KeyVaultName -ErrorAction SilentlyContinue
 if (-not $vault) {
-    $vault = New-AzKeyVault -Name $KeyVaultName -ResourceGroupName $ResourceGroupName -Location $Location -EnableRbacAuthorization $true -EnablePurgeProtection
+    $newVaultParams = @{
+        Name               = $KeyVaultName
+        ResourceGroupName  = $ResourceGroupName
+        Location           = $Location
+        EnablePurgeProtection = $true
+    }
+    $newVaultCommand = Get-Command New-AzKeyVault -ErrorAction Stop
+    if ($newVaultCommand.Parameters.ContainsKey('EnableRbacAuthorization')) {
+        # Az.KeyVault < 6.0.0: RBAC was opt-in.
+        $newVaultParams.EnableRbacAuthorization = $true
+    }
+    # Az.KeyVault 6.0.0+: RBAC is the default, so no enable switch is used.
+    $vault = New-AzKeyVault @newVaultParams
+}
+elseif ($vault.PSObject.Properties['EnableRbacAuthorization'] -and -not [bool]$vault.EnableRbacAuthorization) {
+    $updateVaultCommand = Get-Command Update-AzKeyVault -ErrorAction Stop
+    if ($updateVaultCommand.Parameters.ContainsKey('DisableRbacAuthorization')) {
+        Update-AzKeyVault -VaultName $KeyVaultName -ResourceGroupName $ResourceGroupName -DisableRbacAuthorization $false | Out-Null
+    }
+    elseif ($updateVaultCommand.Parameters.ContainsKey('EnableRbacAuthorization')) {
+        Update-AzKeyVault -VaultName $KeyVaultName -ResourceGroupName $ResourceGroupName -EnableRbacAuthorization $true | Out-Null
+    }
+    else {
+        throw 'The existing Key Vault is not RBAC-enabled and the installed Az.KeyVault module cannot switch its authorization model.'
+    }
+    $vault = Get-AzKeyVault -VaultName $KeyVaultName
 }
 
 $storage = Get-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName -ErrorAction SilentlyContinue
 if (-not $storage) {
-    $storage = New-AzStorageAccount -ResourceGroupName $ResourceGroupName -Name $StorageAccountName -Location $Location -SkuName Standard_LRS -Kind StorageV2 -MinimumTlsVersion TLS1_2 -AllowBlobPublicAccess $false -AllowSharedKeyAccess $false
+    $storage = New-AzStorageAccount `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $StorageAccountName `
+        -Location $Location `
+        -SkuName Standard_LRS `
+        -Kind StorageV2 `
+        -MinimumTlsVersion TLS1_2 `
+        -AllowBlobPublicAccess $false `
+        -AllowSharedKeyAccess $false
+}
+
+try {
+    Update-AzStorageBlobServiceProperty `
+        -ResourceGroupName $ResourceGroupName `
+        -StorageAccountName $StorageAccountName `
+        -IsVersioningEnabled $true `
+        -ErrorAction Stop | Out-Null
+}
+catch {
+    Write-Warning "Could not enable blob versioning automatically: $($_.Exception.Message)"
 }
 
 $automation = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -ErrorAction SilentlyContinue
 if (-not $automation) {
-    $automation = New-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -Location $Location -AssignSystemIdentity
-} else {
-    $automation = Set-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName -AssignSystemIdentity
+    $automation = New-AzAutomationAccount `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $AutomationAccountName `
+        -Location $Location `
+        -AssignSystemIdentity
 }
-$automation = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName
-$principalId = [string]$automation.Identity.PrincipalId
+else {
+    $automation = Set-AzAutomationAccount `
+        -ResourceGroupName $ResourceGroupName `
+        -Name $AutomationAccountName `
+        -AssignSystemIdentity
+}
+
+$principalId = $null
+for ($attempt = 1; $attempt -le 30 -and -not $principalId; $attempt++) {
+    $automation = Get-AzAutomationAccount -ResourceGroupName $ResourceGroupName -Name $AutomationAccountName
+    $principalId = [string]$automation.Identity.PrincipalId
+    if (-not $principalId) { Start-Sleep -Seconds 5 }
+}
 if (-not $principalId) { throw 'Automation managed identity was not available.' }
 
 Ensure-RoleAssignment -ObjectId $principalId -Role 'Key Vault Secrets User' -Scope $vault.ResourceId
 Ensure-RoleAssignment -ObjectId $principalId -Role 'Storage Blob Data Contributor' -Scope $storage.Id
 
+Write-Step 'Granting temporary deployer access to write Key Vault secrets'
 $me = Get-AzADUser -SignedIn -ErrorAction SilentlyContinue
 if (-not $me) { throw 'Unable to resolve the signed-in Azure user for temporary Key Vault access.' }
 $hadVaultRole = [bool](Get-AzRoleAssignment -ObjectId $me.Id -RoleDefinitionName 'Key Vault Secrets Officer' -Scope $vault.ResourceId -ErrorAction SilentlyContinue)
@@ -232,16 +484,22 @@ if (-not $hadVaultRole) {
 }
 
 try {
+    Write-Step 'Configuring Dzidrums runtime identity and Exchange scope'
     $dz = New-RuntimeApp -TenantHint 'dzidrums.com' -Mailbox $DzidrumsMailbox -FriendlyName 'Dzidrums'
+
+    Write-Step 'Configuring Ultra PRO runtime identity and Exchange scope'
     $up = New-RuntimeApp -TenantHint 'ultrapro.com' -Mailbox $UltraProMailbox -FriendlyName 'Ultra PRO'
 
+    Write-Step 'Writing runtime credentials to Azure Key Vault'
     Set-KeyVaultSecretWithRetry -VaultName $KeyVaultName -Name $DzidrumsSecretName -Value $dz.Secret
     Set-KeyVaultSecretWithRetry -VaultName $KeyVaultName -Name $UltraProSecretName -Value $up.Secret
     $dz.Secret = $null
     $up.Secret = $null
 
+    Write-Step 'Publishing Azure Automation runbook'
     $deployScript = Join-Path $PSScriptRoot 'scripts/Deploy-AzureAutomation.ps1'
     if (-not (Test-Path $deployScript)) { throw "Missing deployment helper: $deployScript" }
+
     & $deployScript `
         -SubscriptionId $SubscriptionId `
         -ResourceGroupName $ResourceGroupName `
@@ -271,57 +529,68 @@ try {
     $summary = [ordered]@{
         GeneratedUtc = [datetime]::UtcNow.ToString('o')
         Azure = [ordered]@{
-            SubscriptionId = $SubscriptionId
-            ResourceGroupName = $ResourceGroupName
-            Location = $Location
-            AutomationAccountName = $AutomationAccountName
-            AutomationPrincipalId = $principalId
+            SubscriptionId         = $SubscriptionId
+            ResourceGroupName      = $ResourceGroupName
+            Location               = $Location
+            AutomationAccountName  = $AutomationAccountName
+            AutomationPrincipalId  = $principalId
             RuntimeEnvironmentName = $RuntimeEnvironmentName
-            RunbookName = $RunbookName
-            KeyVaultName = $KeyVaultName
-            StorageAccountName = $StorageAccountName
-            EffectiveSchedule = if ($SkipSchedules) { 'Not created' } else { 'Every 5 minutes via 12 staggered hourly schedules' }
+            RunbookName            = $RunbookName
+            KeyVaultName           = $KeyVaultName
+            StorageAccountName     = $StorageAccountName
+            EffectiveSchedule      = if ($SkipSchedules) { 'Not created' } else { 'Every 5 minutes via 12 staggered hourly schedules' }
         }
         Dzidrums = [ordered]@{
-            TenantId = $dz.TenantId
-            ClientId = $dz.ClientId
-            ApplicationObjectId = $dz.ApplicationObjectId
+            TenantId                 = $dz.TenantId
+            ClientId                 = $dz.ClientId
+            ApplicationObjectId      = $dz.ApplicationObjectId
             ServicePrincipalObjectId = $dz.ServicePrincipalObjectId
-            Mailbox = $DzidrumsMailbox
-            KeyVaultSecretName = $DzidrumsSecretName
-            SecretKeyId = $dz.SecretKeyId
-            SecretExpiresUtc = $dz.SecretExpiresUtc
-            ExchangeScopeName = $dz.ExchangeScopeName
-            ExchangeAssignmentName = $dz.ExchangeAssignmentName
+            Mailbox                  = $DzidrumsMailbox
+            KeyVaultSecretName       = $DzidrumsSecretName
+            SecretKeyId              = $dz.SecretKeyId
+            SecretExpiresUtc         = $dz.SecretExpiresUtc
+            ExchangeScopeName        = $dz.ExchangeScopeName
+            ExchangeAssignmentName   = $dz.ExchangeAssignmentName
         }
         UltraPro = [ordered]@{
-            TenantId = $up.TenantId
-            ClientId = $up.ClientId
-            ApplicationObjectId = $up.ApplicationObjectId
+            TenantId                 = $up.TenantId
+            ClientId                 = $up.ClientId
+            ApplicationObjectId      = $up.ApplicationObjectId
             ServicePrincipalObjectId = $up.ServicePrincipalObjectId
-            Mailbox = $UltraProMailbox
-            KeyVaultSecretName = $UltraProSecretName
-            SecretKeyId = $up.SecretKeyId
-            SecretExpiresUtc = $up.SecretExpiresUtc
-            ExchangeScopeName = $up.ExchangeScopeName
-            ExchangeAssignmentName = $up.ExchangeAssignmentName
+            Mailbox                  = $UltraProMailbox
+            KeyVaultSecretName       = $UltraProSecretName
+            SecretKeyId              = $up.SecretKeyId
+            SecretExpiresUtc         = $up.SecretExpiresUtc
+            ExchangeScopeName        = $up.ExchangeScopeName
+            ExchangeAssignmentName   = $up.ExchangeAssignmentName
         }
         Sync = [ordered]@{
-            DetailMode = $DetailMode
+            DetailMode     = $DetailMode
             RespectPrivate = $RespectPrivate
-            CopyReminders = $CopyReminders
-            PastDays = $PastDays
-            FutureDays = $FutureDays
+            CopyReminders  = $CopyReminders
+            PastDays       = $PastDays
+            FutureDays     = $FutureDays
             RebaselineDays = $RebaselineDays
         }
     }
 
     $summaryPath = Join-Path $PSScriptRoot 'AzureCalendarSync.DeploymentSummary.json'
     $summary | ConvertTo-Json -Depth 20 | Set-Content -Path $summaryPath -Encoding UTF8
-    Write-Host "Bootstrap complete. Deployment summary: $summaryPath"
+
+    Write-Step 'Bootstrap complete'
+    Write-Host "Deployment summary: $summaryPath"
+    Write-Host "Key Vault: $KeyVaultName"
+    Write-Host "Storage account: $StorageAccountName"
+    Write-Host "Automation account: $AutomationAccountName"
+    Write-Host "Runbook: $RunbookName"
+    if ($SkipSchedules) { Write-Host 'Recurring schedules were intentionally not created.' }
 }
 finally {
     if (-not $hadVaultRole) {
-        Remove-AzRoleAssignment -ObjectId $me.Id -RoleDefinitionName 'Key Vault Secrets Officer' -Scope $vault.ResourceId -ErrorAction SilentlyContinue | Out-Null
+        Remove-AzRoleAssignment `
+            -ObjectId $me.Id `
+            -RoleDefinitionName 'Key Vault Secrets Officer' `
+            -Scope $vault.ResourceId `
+            -ErrorAction SilentlyContinue | Out-Null
     }
 }
