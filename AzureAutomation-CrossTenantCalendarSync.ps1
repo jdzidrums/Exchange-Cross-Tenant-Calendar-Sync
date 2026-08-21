@@ -175,7 +175,7 @@ function Get-KeyVaultSecretText {
 
     $token = Get-CachedManagedIdentityToken -For KeyVault
     $safeName = [Uri]::EscapeDataString($SecretName)
-    $uri = "https://$VaultName.vault.azure.net/secrets/$safeName?api-version=7.4"
+    $uri = "https://$VaultName.vault.azure.net/secrets/$($safeName)?api-version=7.4"
 
     $response = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $token" }
     if ([string]::IsNullOrWhiteSpace([string]$response.value)) {

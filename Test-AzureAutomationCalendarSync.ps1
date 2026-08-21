@@ -27,11 +27,29 @@ $cfg = Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 30
 if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount | Out-Null }
 Set-AzContext -SubscriptionId $cfg.Azure.SubscriptionId | Out-Null
 
-$params = @{}
-foreach ($p in $cfg.Sync.RunbookParameters.PSObject.Properties) {
-    $params[$p.Name] = $p.Value
+$params = @{
+    KeyVaultName        = [string]$cfg.Azure.KeyVaultName
+    DzidrumsSecretName  = [string]$cfg.Dzidrums.KeyVaultSecretName
+    UltraProSecretName  = [string]$cfg.UltraPro.KeyVaultSecretName
+    StateStorageAccount = [string]$cfg.Azure.StorageAccountName
+    StateContainer      = 'calendar-sync'
+    StateBlob           = 'calendar-sync-state.json'
+    LockBlob            = 'calendar-sync.lock'
+    DzidrumsTenantId    = [string]$cfg.Dzidrums.TenantId
+    DzidrumsClientId    = [string]$cfg.Dzidrums.ClientId
+    DzidrumsMailbox     = [string]$cfg.Dzidrums.Mailbox
+    UltraProTenantId    = [string]$cfg.UltraPro.TenantId
+    UltraProClientId    = [string]$cfg.UltraPro.ClientId
+    UltraProMailbox     = [string]$cfg.UltraPro.Mailbox
+    DetailMode          = [string]$cfg.Sync.DetailMode
+    RespectPrivate      = [bool]$cfg.Sync.RespectPrivate
+    CopyReminders       = [bool]$cfg.Sync.CopyReminders
+    PastDays            = [int]$cfg.Sync.PastDays
+    FutureDays          = [int]$cfg.Sync.FutureDays
+    RebaselineDays      = [int]$cfg.Sync.RebaselineDays
+    MaxDeltaPages       = 1000
+    Mode                = 'Test'
 }
-$params.Mode = 'Test'
 
 Write-Host "Starting $($cfg.Azure.RunbookName) in Test mode..."
 $job = Start-AzAutomationRunbook `
@@ -61,12 +79,19 @@ foreach ($record in @($output)) {
     if ($record.Type -eq 'Error' -and $record.Value.Exception) {
         Write-Host $record.Value.Exception
     }
+    elseif ($null -ne $record.Value -and $record.Value.PSObject.Properties['value']) {
+        Write-Host $record.Value.value
+    }
     elseif ($null -ne $record.Value) {
         Write-Host $record.Value
     }
 }
 
 if ($current.Status -ne 'Completed') {
+    if (-not [string]::IsNullOrWhiteSpace([string]$current.Exception)) {
+        Write-Host "`n--- Job exception ---"
+        Write-Host $current.Exception
+    }
     throw "Test runbook job ended in state '$($current.Status)'."
 }
 
