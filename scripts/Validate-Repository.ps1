@@ -12,9 +12,31 @@ $errors = New-Object System.Collections.Generic.List[object]
 foreach ($file in $files) {
     $tokens = $null
     $parseErrors = $null
-    [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
     foreach ($parseError in @($parseErrors)) {
         $errors.Add([pscustomobject]@{ File = $file.FullName; Message = $parseError.Message; Extent = $parseError.Extent.Text })
+    }
+
+    if ($file.Name -eq 'AzureAutomation-CrossTenantCalendarSync.ps1') {
+        $writeLog = $ast.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-Log'
+        }, $true)
+        $writesToSuccessPipeline = $writeLog -and $writeLog.Body.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Output'
+        }, $true)
+        $writesToHost = $writeLog -and $writeLog.Body.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Host'
+        }, $true)
+        if (-not $writeLog -or $writesToSuccessPipeline -or -not $writesToHost) {
+            $errors.Add([pscustomobject]@{
+                File = $file.FullName
+                Message = 'Write-Log must use Write-Host and must not write diagnostics to the success pipeline.'
+                Extent = 'Write-Log'
+            })
+        }
     }
 }
 
