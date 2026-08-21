@@ -78,6 +78,22 @@ foreach ($file in $files) {
                 })
             }
         }
+
+        $unsafeEventPropertyAccess = @($ast.FindAll({
+            param($node)
+            if ($node -isnot [System.Management.Automation.Language.MemberExpressionAst]) { return $false }
+            if ($node.Expression -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
+            return [string]$node.Expression.VariablePath.UserPath -ieq 'event'
+        }, $true))
+        if ($unsafeEventPropertyAccess.Count -gt 0) {
+            foreach ($unsafeAccess in $unsafeEventPropertyAccess) {
+                $errors.Add([pscustomobject]@{
+                    File = $file.FullName
+                    Message = 'Graph event properties must be read through Get-ObjectPropertyValue under StrictMode.'
+                    Extent = $unsafeAccess.Extent.Text
+                })
+            }
+        }
     }
 }
 
