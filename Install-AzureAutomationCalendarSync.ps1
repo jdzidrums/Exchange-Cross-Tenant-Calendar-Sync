@@ -139,39 +139,40 @@ function Connect-CalendarSyncGraph {
         [Parameter(Mandatory)][string]$FriendlyName
     )
 
-    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+    $ctx = Get-MgContext -ErrorAction SilentlyContinue
 
-    Write-Host "`nMicrosoft Graph sign-in required for $FriendlyName ($TenantId)." -ForegroundColor Yellow
-    Write-Host 'When the device code appears, open https://microsoft.com/devicelogin immediately and complete sign-in.' -ForegroundColor Yellow
-
-    $connectCommand = Get-Command Connect-MgGraph -ErrorAction Stop
-    $connectParams = @{
-        TenantId     = $TenantId
-        Scopes       = $Scopes
-        ContextScope = 'Process'
-        NoWelcome    = $true
-        ErrorAction  = 'Stop'
-    }
-    if ($connectCommand.Parameters.ContainsKey('UseDeviceCode')) {
-        $connectParams.UseDeviceCode = $true
-    }
-    elseif ($connectCommand.Parameters.ContainsKey('UseDeviceAuthentication')) {
-        $connectParams.UseDeviceAuthentication = $true
-    }
-    else {
-        throw 'Installed Microsoft.Graph.Authentication does not support device-code authentication. Update the module and retry.'
-    }
-    if ($connectCommand.Parameters.ContainsKey('ClientTimeout')) {
-        $connectParams.ClientTimeout = 600
+    if ($ctx -and $ctx.TenantId -eq $TenantId) {
+        Write-Host ""
+        Write-Host "Using existing Microsoft Graph session" -ForegroundColor Green
+        Write-Host " Account: $($ctx.Account)"
+        Write-Host " Tenant:  $($ctx.TenantId)"
+        return $ctx
     }
 
-    Connect-MgGraph @connectParams
+    Write-Host ""
+    Write-Host "Microsoft Graph sign-in required for $FriendlyName ($TenantId)." -ForegroundColor Yellow
+    Write-Host "Open https://microsoft.com/devicelogin immediately when prompted." -ForegroundColor Yellow
+
+    Connect-MgGraph `
+        -TenantId $TenantId `
+        -Scopes $Scopes `
+        -UseDeviceCode `
+        -ClientTimeout 600 `
+        -ContextScope CurrentUser `
+        -NoWelcome `
+        -ErrorAction Stop
+
     $ctx = Get-MgContext
-    if (-not $ctx -or [string]::IsNullOrWhiteSpace([string]$ctx.TenantId)) {
-        throw "Microsoft Graph authentication did not establish a usable context for $FriendlyName."
+
+    if (-not $ctx) {
+        throw "Microsoft Graph authentication failed for $FriendlyName."
     }
 
-    Write-Host "Microsoft Graph authenticated: $($ctx.Account) / tenant $($ctx.TenantId)"
+    Write-Host ""
+    Write-Host "Microsoft Graph authenticated successfully" -ForegroundColor Green
+    Write-Host " Account: $($ctx.Account)"
+    Write-Host " Tenant:  $($ctx.TenantId)"
+
     return $ctx
 }
 
@@ -366,7 +367,9 @@ function New-RuntimeApp {
         if ($exchangeConnected) {
             Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         }
-        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+
+        # Do not disconnect Microsoft Graph here.
+        # The bootstrap handles tenant transitions explicitly.
     }
 }
 

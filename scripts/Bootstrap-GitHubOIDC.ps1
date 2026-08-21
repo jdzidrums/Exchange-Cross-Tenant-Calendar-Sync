@@ -6,14 +6,15 @@
 
 .DESCRIPTION
   Creates one GitHub OIDC workload identity in each M365 tenant and one in the
-  Azure tenant. The two M365 deployers receive Exchange.ManageAsApp and the
-  Exchange Administrator directory role so they can maintain the narrowly
-  scoped runtime Application RBAC assignment. The Azure deployer receives
-  Automation Contributor only on the target Automation account.
+  Azure tenant. The two M365 deployers receive Exchange.ManageAsApp,
+  Microsoft Graph Application.Read.All, and the Exchange Administrator
+  directory role so CI/CD can maintain the narrowly scoped runtime Application
+  RBAC assignment. The Azure deployer receives Automation Contributor only on
+  the target Automation account.
 
-  This bootstrap is intentionally interactive and must be run by appropriately
-  privileged administrators. The resulting GitHubActions.EnvironmentVariables.json
-  contains identifiers/configuration only; it contains no client secret.
+  Interactive Microsoft Graph authentication uses device-code flow with an
+  extended timeout, and Graph changes are made through Invoke-MgGraphRequest.
+  No GitHub client secret is created.
 #>
 
 [CmdletBinding()]
@@ -29,17 +30,17 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 
 function Ensure-Module {
     param([Parameter(Mandatory)][string]$Name)
-    if (-not (Get-Module -ListAvailable -Name $Name)) {
+    if (-not (Get-Module -ListAvailable -Name $Name | Select-Object -First 1)) {
         Install-Module -Name $Name -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
     }
 }
 
 foreach ($module in @(
     'Microsoft.Graph.Authentication',
-    'Microsoft.Graph.Applications',
     'Az.Accounts',
     'Az.Resources'
 )) {
@@ -47,7 +48,6 @@ foreach ($module in @(
 }
 
 Import-Module Microsoft.Graph.Authentication
-Import-Module Microsoft.Graph.Applications
 Import-Module Az.Accounts
 Import-Module Az.Resources
 
@@ -55,24 +55,91 @@ $summaryPath = [System.IO.Path]::GetFullPath($DeploymentSummaryPath)
 if (-not (Test-Path $summaryPath)) { throw "Deployment summary not found: $summaryPath" }
 $summary = Get-Content -Path $summaryPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 50
 
-$subject = "repo:$GitHubOwner@$GitHubOwnerId/$GitHubRepository@$GitHubRepositoryId:environment:$GitHubEnvironment"
+$subject = "repo:$GitHubOwner@$GitHubOwnerId/$GitHubRepository@$GitHubRepositoryId`:environment:$GitHubEnvironment"
+$issuer = 'https://token.actions.githubusercontent.com'
+$audience = 'api://AzureADTokenExchange'
 Write-Host "GitHub OIDC subject: $subject"
+
+function Connect-CalendarSyncGraph {
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string[]]$Scopes,
+        [Parameter(Mandatory)][string]$FriendlyName
+    )
+
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
+
+    Write-Host "`nMicrosoft Graph sign-in required for $FriendlyName ($TenantId)." -ForegroundColor Yellow
+    Write-Host 'When the device code appears, open https://microsoft.com/devicelogin immediately and complete sign-in.' -ForegroundColor Yellow
+
+    $command = Get-Command Connect-MgGraph -ErrorAction Stop
+    $params = @{
+        TenantId     = $TenantId
+        Scopes       = $Scopes
+        ContextScope = 'Process'
+        NoWelcome    = $true
+        ErrorAction  = 'Stop'
+    }
+    if ($command.Parameters.ContainsKey('UseDeviceCode')) {
+        $params.UseDeviceCode = $true
+    }
+    elseif ($command.Parameters.ContainsKey('UseDeviceAuthentication')) {
+        $params.UseDeviceAuthentication = $true
+    }
+    else {
+        throw 'Installed Microsoft.Graph.Authentication does not support device-code authentication. Update the module and retry.'
+    }
+    if ($command.Parameters.ContainsKey('ClientTimeout')) {
+        $params.ClientTimeout = 600
+    }
+
+    Connect-MgGraph @params
+    $ctx = Get-MgContext
+    if (-not $ctx -or [string]::IsNullOrWhiteSpace([string]$ctx.TenantId)) {
+        throw "Microsoft Graph authentication did not establish a usable context for $FriendlyName."
+    }
+    Write-Host "Microsoft Graph authenticated: $($ctx.Account) / tenant $($ctx.TenantId)"
+    return $ctx
+}
+
+function Get-GraphCollection {
+    param(
+        [Parameter(Mandatory)][string]$Resource,
+        [Parameter(Mandatory)][string]$Filter,
+        [string]$Select
+    )
+
+    $encodedFilter = [Uri]::EscapeDataString($Filter)
+    $uri = "https://graph.microsoft.com/v1.0/${Resource}?`$filter=$encodedFilter"
+    if ($Select) { $uri += "&`$select=$([Uri]::EscapeDataString($Select))" }
+    $response = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
+    return @($response.value)
+}
 
 function Get-OrCreateApplication {
     param([Parameter(Mandatory)][string]$DisplayName)
+
     $escaped = $DisplayName.Replace("'", "''")
-    $apps = @(Get-MgApplication -Filter "displayName eq '$escaped'" -All)
+    $apps = @(Get-GraphCollection -Resource 'applications' -Filter "displayName eq '$escaped'")
     if ($apps.Count -gt 1) { throw "Multiple app registrations named '$DisplayName' exist." }
     if ($apps.Count -eq 1) { return $apps[0] }
-    New-MgApplication -DisplayName $DisplayName -SignInAudience 'AzureADMyOrg'
+
+    return Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/applications' -Body @{
+        displayName    = $DisplayName
+        signInAudience = 'AzureADMyOrg'
+    } -ErrorAction Stop
 }
 
 function Get-OrCreateServicePrincipal {
     param([Parameter(Mandatory)][string]$AppId)
-    $sps = @(Get-MgServicePrincipal -Filter "appId eq '$AppId'" -All)
-    if ($sps.Count -gt 1) { throw "Multiple service principals were returned for AppId $AppId." }
+
+    $sps = @(Get-GraphCollection -Resource 'servicePrincipals' -Filter "appId eq '$AppId'")
+    if ($sps.Count -gt 1) { throw "Multiple service principals were returned for appId $AppId." }
     if ($sps.Count -eq 1) { return $sps[0] }
-    New-MgServicePrincipal -AppId $AppId
+
+    return Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals' -Body @{
+        appId = $AppId
+    } -ErrorAction Stop
 }
 
 function Set-GitHubFederatedCredential {
@@ -80,104 +147,100 @@ function Set-GitHubFederatedCredential {
         [Parameter(Mandatory)][string]$ApplicationObjectId,
         [Parameter(Mandatory)][string]$Name
     )
+
     $collectionUri = "https://graph.microsoft.com/v1.0/applications/$ApplicationObjectId/federatedIdentityCredentials"
-    $existingResponse = Invoke-MgGraphRequest -Method GET -Uri $collectionUri
-    $existing = @($existingResponse.value | Where-Object { $_.name -eq $Name }) | Select-Object -First 1
-    $body = @{
+    $response = Invoke-MgGraphRequest -Method GET -Uri $collectionUri -ErrorAction Stop
+    $existing = @($response.value | Where-Object { $_.name -eq $Name }) | Select-Object -First 1
+
+    $desired = @{
         name        = $Name
-        issuer      = 'https://token.actions.githubusercontent.com'
+        issuer      = $issuer
         subject     = $subject
-        audiences   = @('api://AzureADTokenExchange')
+        audiences   = @($audience)
         description = "GitHub Actions $GitHubEnvironment deployment for $GitHubOwner/$GitHubRepository"
     }
+
     if ($existing) {
-        Invoke-MgGraphRequest -Method PATCH -Uri "$collectionUri/$($existing.id)" -Body $body | Out-Null
-        Write-Host "Updated federated credential: $Name"
+        $same = ([string]$existing.issuer -eq $issuer) -and
+                ([string]$existing.subject -eq $subject) -and
+                (@($existing.audiences) -contains $audience)
+        if ($same) {
+            Write-Host "Federated credential already correct: $Name"
+            return
+        }
+
+        Invoke-MgGraphRequest -Method DELETE -Uri "$collectionUri/$($existing.id)" -ErrorAction Stop | Out-Null
     }
-    else {
-        Invoke-MgGraphRequest -Method POST -Uri $collectionUri -Body $body | Out-Null
-        Write-Host "Created federated credential: $Name"
-    }
+
+    Invoke-MgGraphRequest -Method POST -Uri $collectionUri -Body $desired -ErrorAction Stop | Out-Null
+    Write-Host "Created federated credential: $Name"
 }
 
-function Grant-GraphApplicationReadAll {
-    param([Parameter(Mandatory)]$ServicePrincipal)
+function Grant-ServicePrincipalAppRole {
+    param(
+        [Parameter(Mandatory)]$ServicePrincipal,
+        [Parameter(Mandatory)][string]$ResourceAppId,
+        [Parameter(Mandatory)][string[]]$RoleValues
+    )
 
-    $graphResource = @(Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" -All) | Select-Object -First 1
-    if (-not $graphResource) { throw 'Microsoft Graph enterprise application was not found.' }
-    $appRole = @($graphResource.AppRoles | Where-Object {
-        $_.Value -eq 'Application.Read.All' -and $_.AllowedMemberTypes -contains 'Application'
-    }) | Select-Object -First 1
-    if (-not $appRole) { throw 'Microsoft Graph Application.Read.All application role was not found.' }
+    $resources = @(Get-GraphCollection -Resource 'servicePrincipals' -Filter "appId eq '$ResourceAppId'" -Select 'id,appRoles,appId,displayName')
+    $resource = $resources | Select-Object -First 1
+    if (-not $resource) { throw "Resource service principal $ResourceAppId was not found." }
 
-    $assignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ServicePrincipal.Id -All -ErrorAction SilentlyContinue)
-    $exists = $assignments | Where-Object {
-        [string]$_.ResourceId -eq [string]$graphResource.Id -and [string]$_.AppRoleId -eq [string]$appRole.Id
+    $role = $null
+    foreach ($value in $RoleValues) {
+        $role = @($resource.appRoles | Where-Object {
+            [string]$_.value -eq $value -and @($_.allowedMemberTypes) -contains 'Application'
+        }) | Select-Object -First 1
+        if ($role) { break }
     }
+    if (-not $role) { throw "None of the requested application roles were found: $($RoleValues -join ', ')." }
+
+    $assignmentUri = "https://graph.microsoft.com/v1.0/servicePrincipals/$($ServicePrincipal.id)/appRoleAssignments"
+    $assignmentResponse = Invoke-MgGraphRequest -Method GET -Uri $assignmentUri -ErrorAction Stop
+    $exists = @($assignmentResponse.value | Where-Object {
+        [string]$_.resourceId -eq [string]$resource.id -and [string]$_.appRoleId -eq [string]$role.id
+    }).Count -gt 0
+
     if (-not $exists) {
-        New-MgServicePrincipalAppRoleAssignment `
-            -ServicePrincipalId $ServicePrincipal.Id `
-            -PrincipalId $ServicePrincipal.Id `
-            -ResourceId $graphResource.Id `
-            -AppRoleId $appRole.Id | Out-Null
-        Write-Host 'Granted Microsoft Graph Application.Read.All for fail-closed runtime-app validation.'
-    }
-}
-
-function Grant-ExchangeManageAsApp {
-    param([Parameter(Mandatory)]$ServicePrincipal)
-
-    $exchangeResource = @(Get-MgServicePrincipal -Filter "appId eq '00000002-0000-0ff1-ce00-000000000000'" -All) | Select-Object -First 1
-    if (-not $exchangeResource) { throw 'Office 365 Exchange Online enterprise application was not found.' }
-
-    $appRole = @($exchangeResource.AppRoles | Where-Object {
-        $_.Value -in @('Exchange.ManageAsApp','Exchange.ManageAsAppV2') -and $_.AllowedMemberTypes -contains 'Application'
-    }) | Sort-Object @{ Expression = { if ($_.Value -eq 'Exchange.ManageAsApp') { 0 } else { 1 } } } | Select-Object -First 1
-
-    if (-not $appRole) { throw 'Exchange.ManageAsApp application role was not found on the Exchange Online service principal.' }
-
-    $assignments = @(Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $ServicePrincipal.Id -All -ErrorAction SilentlyContinue)
-    $exists = $assignments | Where-Object {
-        [string]$_.ResourceId -eq [string]$exchangeResource.Id -and [string]$_.AppRoleId -eq [string]$appRole.Id
-    }
-    if (-not $exists) {
-        New-MgServicePrincipalAppRoleAssignment `
-            -ServicePrincipalId $ServicePrincipal.Id `
-            -PrincipalId $ServicePrincipal.Id `
-            -ResourceId $exchangeResource.Id `
-            -AppRoleId $appRole.Id | Out-Null
-        Write-Host "Granted $($appRole.Value)."
+        Invoke-MgGraphRequest -Method POST -Uri $assignmentUri -Body @{
+            principalId = [string]$ServicePrincipal.id
+            resourceId  = [string]$resource.id
+            appRoleId   = [string]$role.id
+        } -ErrorAction Stop | Out-Null
+        Write-Host "Granted application role $($role.value)."
     }
 }
 
 function Grant-ExchangeAdministratorDirectoryRole {
     param([Parameter(Mandatory)]$ServicePrincipal)
 
-    $roleUri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$filter=displayName%20eq%20%27Exchange%20Administrator%27"
-    $roleResponse = Invoke-MgGraphRequest -Method GET -Uri $roleUri
+    $filter = [Uri]::EscapeDataString("displayName eq 'Exchange Administrator'")
+    $roleResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions?`$filter=$filter" -ErrorAction Stop
     $role = @($roleResponse.value) | Select-Object -First 1
     if (-not $role) { throw 'Exchange Administrator directory role definition was not found.' }
 
-    $assignUri = "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId%20eq%20%27$($ServicePrincipal.Id)%27"
-    $assignmentResponse = Invoke-MgGraphRequest -Method GET -Uri $assignUri
-    $existing = @($assignmentResponse.value | Where-Object {
+    $assignmentFilter = [Uri]::EscapeDataString("principalId eq '$($ServicePrincipal.id)'")
+    $assignmentResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=$assignmentFilter" -ErrorAction Stop
+    $exists = @($assignmentResponse.value | Where-Object {
         [string]$_.roleDefinitionId -eq [string]$role.id -and [string]$_.directoryScopeId -eq '/'
-    })
-    if ($existing.Count -eq 0) {
+    }).Count -gt 0
+
+    if (-not $exists) {
         Invoke-MgGraphRequest -Method POST -Uri 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments' -Body @{
-            principalId      = $ServicePrincipal.Id
-            roleDefinitionId = $role.id
+            principalId      = [string]$ServicePrincipal.id
+            roleDefinitionId = [string]$role.id
             directoryScopeId = '/'
-        } | Out-Null
+        } -ErrorAction Stop | Out-Null
         Write-Host 'Assigned Exchange Administrator directory role to the GitHub deployer.'
     }
 }
 
 function Get-InitialDomain {
-    $domains = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/domains'
+    $domains = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/domains' -ErrorAction Stop
     $initial = @($domains.value | Where-Object { $_.isInitial -eq $true }) | Select-Object -First 1
     if (-not $initial) { throw 'Unable to determine the tenant initial .onmicrosoft.com domain.' }
-    [string]$initial.id
+    return [string]$initial.id
 }
 
 function New-M365GitHubDeployer {
@@ -186,29 +249,31 @@ function New-M365GitHubDeployer {
         [Parameter(Mandatory)][string]$FriendlyName
     )
 
-    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
-    Write-Host "Sign in to bootstrap the $FriendlyName tenant ($TenantId)."
-    Connect-MgGraph -TenantId $TenantId -Scopes @(
-        'Application.ReadWrite.All',
-        'AppRoleAssignment.ReadWrite.All',
-        'RoleManagement.ReadWrite.Directory',
-        'Domain.Read.All'
-    ) -NoWelcome
+    Connect-CalendarSyncGraph `
+        -TenantId $TenantId `
+        -Scopes @('Application.ReadWrite.All','AppRoleAssignment.ReadWrite.All','RoleManagement.ReadWrite.Directory','Domain.Read.All') `
+        -FriendlyName "$FriendlyName GitHub deployer" | Out-Null
 
     try {
         $app = Get-OrCreateApplication -DisplayName "GitHub Actions Calendar Sync Deployer - $FriendlyName"
-        $sp = Get-OrCreateServicePrincipal -AppId $app.AppId
-        Set-GitHubFederatedCredential -ApplicationObjectId $app.Id -Name 'github-production'
-        Grant-ExchangeManageAsApp -ServicePrincipal $sp
-        Grant-GraphApplicationReadAll -ServicePrincipal $sp
-        Grant-ExchangeAdministratorDirectoryRole -ServicePrincipal $sp
-        $organization = Get-InitialDomain
+        $sp = Get-OrCreateServicePrincipal -AppId ([string]$app.appId)
 
-        [pscustomobject]@{
+        Set-GitHubFederatedCredential -ApplicationObjectId ([string]$app.id) -Name 'github-production'
+        Grant-ServicePrincipalAppRole `
+            -ServicePrincipal $sp `
+            -ResourceAppId '00000002-0000-0ff1-ce00-000000000000' `
+            -RoleValues @('Exchange.ManageAsApp','Exchange.ManageAsAppV2')
+        Grant-ServicePrincipalAppRole `
+            -ServicePrincipal $sp `
+            -ResourceAppId '00000003-0000-0000-c000-000000000000' `
+            -RoleValues @('Application.Read.All')
+        Grant-ExchangeAdministratorDirectoryRole -ServicePrincipal $sp
+
+        return [pscustomobject]@{
             TenantId      = $TenantId
-            ClientId      = [string]$app.AppId
-            ServiceObject = [string]$sp.Id
-            Organization  = $organization
+            ClientId      = [string]$app.appId
+            ServiceObject = [string]$sp.id
+            Organization  = Get-InitialDomain
         }
     }
     finally {
@@ -219,63 +284,91 @@ function New-M365GitHubDeployer {
 $dz = New-M365GitHubDeployer -TenantId ([string]$summary.Dzidrums.TenantId) -FriendlyName 'Dzidrums'
 $up = New-M365GitHubDeployer -TenantId ([string]$summary.UltraPro.TenantId) -FriendlyName 'Ultra PRO'
 
-Write-Host 'Sign in to the Azure subscription that hosts the Automation account.'
-if ($AzureTenantId) {
-    Connect-AzAccount -Tenant $AzureTenantId -Subscription ([string]$summary.Azure.SubscriptionId) | Out-Null
+Write-Host '`nAzure sign-in required for the subscription that hosts the Automation account.' -ForegroundColor Yellow
+$currentAz = Get-AzContext -ErrorAction SilentlyContinue
+if (-not $currentAz -or [string]$currentAz.Subscription.Id -ne [string]$summary.Azure.SubscriptionId) {
+    $azParams = @{
+        Subscription          = [string]$summary.Azure.SubscriptionId
+        UseDeviceAuthentication = $true
+        ErrorAction           = 'Stop'
+    }
+    if ($AzureTenantId) { $azParams.Tenant = $AzureTenantId }
+    Connect-AzAccount @azParams | Out-Null
 }
-else {
-    Connect-AzAccount -Subscription ([string]$summary.Azure.SubscriptionId) | Out-Null
-}
+Set-AzContext -SubscriptionId ([string]$summary.Azure.SubscriptionId) | Out-Null
 $azContext = Get-AzContext
 $AzureTenantId = [string]$azContext.Tenant.Id
 
-try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
-Write-Host "Sign in to Microsoft Graph for Azure tenant $AzureTenantId to create the Azure GitHub deployer."
-Connect-MgGraph -TenantId $AzureTenantId -Scopes 'Application.ReadWrite.All' -NoWelcome
+Connect-CalendarSyncGraph `
+    -TenantId $AzureTenantId `
+    -Scopes @('Application.ReadWrite.All') `
+    -FriendlyName 'Azure Automation GitHub deployer' | Out-Null
 try {
     $azureApp = Get-OrCreateApplication -DisplayName 'GitHub Actions Calendar Sync Deployer - Azure Automation'
-    $azureSp = Get-OrCreateServicePrincipal -AppId $azureApp.AppId
-    Set-GitHubFederatedCredential -ApplicationObjectId $azureApp.Id -Name 'github-production'
+    $azureSp = Get-OrCreateServicePrincipal -AppId ([string]$azureApp.appId)
+    Set-GitHubFederatedCredential -ApplicationObjectId ([string]$azureApp.id) -Name 'github-production'
 }
 finally {
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 }
 
 $automationScope = "/subscriptions/$($summary.Azure.SubscriptionId)/resourceGroups/$($summary.Azure.ResourceGroupName)/providers/Microsoft.Automation/automationAccounts/$($summary.Azure.AutomationAccountName)"
-$role = Get-AzRoleAssignment -ObjectId $azureSp.Id -RoleDefinitionName 'Automation Contributor' -Scope $automationScope -ErrorAction SilentlyContinue
+$role = Get-AzRoleAssignment `
+    -ObjectId ([string]$azureSp.id) `
+    -RoleDefinitionName 'Automation Contributor' `
+    -Scope $automationScope `
+    -ErrorAction SilentlyContinue
 if (-not $role) {
-    New-AzRoleAssignment -ObjectId $azureSp.Id -RoleDefinitionName 'Automation Contributor' -Scope $automationScope | Out-Null
+    New-AzRoleAssignment `
+        -ObjectId ([string]$azureSp.id) `
+        -RoleDefinitionName 'Automation Contributor' `
+        -Scope $automationScope | Out-Null
     Write-Host "Granted Automation Contributor at $automationScope"
 }
 
 function Resolve-RuntimeServicePrincipalId {
-    param([Parameter(Mandatory)][string]$TenantId, [Parameter(Mandatory)][string]$ClientId)
-    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch {}
-    Connect-MgGraph -TenantId $TenantId -Scopes 'Application.Read.All' -NoWelcome
+    param(
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$FriendlyName
+    )
+
+    Connect-CalendarSyncGraph -TenantId $TenantId -Scopes @('Application.Read.All') -FriendlyName $FriendlyName | Out-Null
     try {
-        $sp = @(Get-MgServicePrincipal -Filter "appId eq '$ClientId'" -All) | Select-Object -First 1
+        $sp = @(Get-GraphCollection -Resource 'servicePrincipals' -Filter "appId eq '$ClientId'") | Select-Object -First 1
         if (-not $sp) { throw "Runtime service principal $ClientId was not found in tenant $TenantId." }
-        [string]$sp.Id
+        return [string]$sp.id
     }
-    finally { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null }
+    finally {
+        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    }
 }
 
 $dzRuntimeSp = if ($summary.Dzidrums.PSObject.Properties['ServicePrincipalObjectId']) {
     [string]$summary.Dzidrums.ServicePrincipalObjectId
-} else {
-    Resolve-RuntimeServicePrincipalId -TenantId ([string]$summary.Dzidrums.TenantId) -ClientId ([string]$summary.Dzidrums.ClientId)
 }
+else {
+    Resolve-RuntimeServicePrincipalId `
+        -TenantId ([string]$summary.Dzidrums.TenantId) `
+        -ClientId ([string]$summary.Dzidrums.ClientId) `
+        -FriendlyName 'Dzidrums runtime service principal lookup'
+}
+
 $upRuntimeSp = if ($summary.UltraPro.PSObject.Properties['ServicePrincipalObjectId']) {
     [string]$summary.UltraPro.ServicePrincipalObjectId
-} else {
-    Resolve-RuntimeServicePrincipalId -TenantId ([string]$summary.UltraPro.TenantId) -ClientId ([string]$summary.UltraPro.ClientId)
+}
+else {
+    Resolve-RuntimeServicePrincipalId `
+        -TenantId ([string]$summary.UltraPro.TenantId) `
+        -ClientId ([string]$summary.UltraPro.ClientId) `
+        -FriendlyName 'Ultra PRO runtime service principal lookup'
 }
 
 $variables = [ordered]@{
     CALENDAR_SYNC_CICD_ENABLED       = 'true'
     AZURE_TENANT_ID                  = $AzureTenantId
     AZURE_SUBSCRIPTION_ID            = [string]$summary.Azure.SubscriptionId
-    AZURE_DEPLOYER_CLIENT_ID         = [string]$azureApp.AppId
+    AZURE_DEPLOYER_CLIENT_ID         = [string]$azureApp.appId
     AZURE_RESOURCE_GROUP             = [string]$summary.Azure.ResourceGroupName
     AZURE_LOCATION                   = [string]$summary.Azure.Location
     AUTOMATION_ACCOUNT_NAME          = [string]$summary.Azure.AutomationAccountName
@@ -311,12 +404,12 @@ $variables = [ordered]@{
 $output = [ordered]@{
     GeneratedUtc = [datetime]::UtcNow.ToString('o')
     GitHub = [ordered]@{
-        Owner        = $GitHubOwner
-        OwnerId      = $GitHubOwnerId
-        Repository   = $GitHubRepository
-        RepositoryId = $GitHubRepositoryId
-        Environment  = $GitHubEnvironment
-        OidcSubject  = $subject
+        Owner          = $GitHubOwner
+        OwnerId        = $GitHubOwnerId
+        Repository     = $GitHubRepository
+        RepositoryId   = $GitHubRepositoryId
+        Environment    = $GitHubEnvironment
+        ImmutableSubject = $subject
     }
     Variables = $variables
 }
@@ -328,4 +421,5 @@ Write-Host ''
 Write-Host 'OIDC BOOTSTRAP COMPLETE'
 Write-Host "Configuration written to: $outputPath"
 Write-Host 'No client secrets were written to this file.'
-Write-Host 'Create GitHub environment production and copy these Variables into GitHub Actions variables.'
+Write-Host "OIDC subject: $subject"
+Write-Host 'Next: run scripts/Configure-GitHubRepositoryVariables.ps1, then perform one manual deploy=true workflow run.'
