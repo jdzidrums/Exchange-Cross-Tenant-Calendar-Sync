@@ -112,6 +112,11 @@ function Ensure-RoleAssignment {
 }
 
 function Set-KeyVaultSecretWithRetry {
+    [System.Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText',
+        '',
+        Justification = 'Microsoft Graph returns newly generated client secrets as plaintext, while Set-AzKeyVaultSecret requires a SecureString.'
+    )]
     param(
         [Parameter(Mandatory)][string]$VaultName,
         [Parameter(Mandatory)][string]$Name,
