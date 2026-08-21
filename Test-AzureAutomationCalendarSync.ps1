@@ -79,6 +79,17 @@ foreach ($record in @($output)) {
     if ($record.Type -eq 'Error' -and $record.Value.Exception) {
         Write-Host $record.Value.Exception
     }
+    elseif ($record.Type -eq 'Warning') {
+        if ($record.Value -is [System.Collections.IDictionary] -and $record.Value.Contains('Message')) {
+            Write-Host $record.Value['Message']
+        }
+        elseif ($null -ne $record.Value -and $record.Value.PSObject.Properties['Message']) {
+            Write-Host $record.Value.Message
+        }
+        else {
+            Write-Host ([string]$record.Value)
+        }
+    }
     elseif ($record.Value -is [System.Collections.IDictionary] -and $record.Value.Contains('value')) {
         Write-Host $record.Value['value']
     }
