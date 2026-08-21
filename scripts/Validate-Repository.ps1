@@ -26,14 +26,14 @@ foreach ($file in $files) {
             param($node)
             $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Output'
         }, $true)
-        $writesToHost = $writeLog -and $writeLog.Body.Find({
+        $writesToVerbose = $writeLog -and $writeLog.Body.Find({
             param($node)
-            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Host'
+            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Verbose'
         }, $true)
-        if (-not $writeLog -or $writesToSuccessPipeline -or -not $writesToHost) {
+        if (-not $writeLog -or $writesToSuccessPipeline -or -not $writesToVerbose) {
             $errors.Add([pscustomobject]@{
                 File = $file.FullName
-                Message = 'Write-Log must use Write-Host and must not write diagnostics to the success pipeline.'
+                Message = 'Write-Log must use Write-Verbose and must not write diagnostics to the success pipeline.'
                 Extent = 'Write-Log'
             })
         }
