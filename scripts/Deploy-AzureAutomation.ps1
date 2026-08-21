@@ -101,7 +101,13 @@ function Wait-ForArmProvisioning {
     for ($i = 1; $i -le $MaxAttempts; $i++) {
         Start-Sleep -Seconds 3
         $item = Invoke-ArmRest -Method GET -Uri $Uri
-        $state = [string]$item.properties.provisioningState
+        $stateProperty = if ($item.PSObject.Properties['properties']) {
+            $item.properties.PSObject.Properties['provisioningState']
+        }
+        else {
+            $null
+        }
+        $state = if ($stateProperty) { [string]$stateProperty.Value } else { '' }
         if ($state -eq 'Succeeded' -or [string]::IsNullOrWhiteSpace($state)) { return $item }
         if ($state -in @('Failed','Canceled')) { throw "ARM provisioning ended in state '$state'." }
     }
