@@ -22,20 +22,39 @@ foreach ($file in $files) {
             param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Write-Log'
         }, $true)
-        $writesToSuccessPipeline = $writeLog -and $writeLog.Body.Find({
+        $writesToOutput = $writeLog -and $writeLog.Body.Find({
             param($node)
             $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Output'
         }, $true)
-        $writesToVerbose = $writeLog -and $writeLog.Body.Find({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Verbose'
-        }, $true)
-        if (-not $writeLog -or $writesToSuccessPipeline -or -not $writesToVerbose) {
+        if (-not $writeLog -or -not $writesToOutput) {
             $errors.Add([pscustomobject]@{
                 File = $file.FullName
-                Message = 'Write-Log must use Write-Verbose and must not write diagnostics to the success pipeline.'
+                Message = 'Write-Log must emit concise informational records with Write-Output.'
                 Extent = 'Write-Log'
             })
+        }
+
+        foreach ($functionName in @('Acquire-StorageLease','Get-State','Invoke-Graph')) {
+            $dataFunction = $ast.Find({
+                param($node)
+                $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+            }, $true)
+            $nestedLogs = if ($dataFunction) {
+                @($dataFunction.Body.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Write-Log'
+                }, $true))
+            }
+            else {
+                @()
+            }
+            if (-not $dataFunction -or @($nestedLogs).Count -gt 0) {
+                $errors.Add([pscustomobject]@{
+                    File = $file.FullName
+                    Message = "$functionName must not log to the success pipeline while returning data."
+                    Extent = $functionName
+                })
+            }
         }
     }
 }

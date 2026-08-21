@@ -87,6 +87,7 @@ $script:StorageToken = $null
 $script:StorageTokenExpiresUtc = [datetime]::MinValue
 $script:KeyVaultToken = $null
 $script:KeyVaultTokenExpiresUtc = [datetime]::MinValue
+$script:StateWasNew = $false
 
 function Write-Log {
     param(
@@ -95,14 +96,12 @@ function Write-Log {
     )
 
     $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
-    # Keep diagnostics off the success pipeline so functions that log while
-    # returning data cannot accidentally turn their result into an array.
     $line = "[$stamp] [$Level] $Message"
     if ($Level -eq 'WARN') {
         Write-Warning $line
     }
     else {
-        Write-Verbose $line -Verbose
+        Write-Output $line
     }
 }
 
@@ -265,13 +264,11 @@ function Acquire-StorageLease {
         Invoke-WebRequest -Method PUT -Uri $uri -Headers $headers -UseBasicParsing | Out-Null
         $script:LeaseId = $leaseId
         $script:LeaseLastRenewalUtc = [datetime]::UtcNow
-        Write-Log 'Acquired distributed synchronization lock.'
         return $true
     }
     catch {
         $status = Get-ExceptionStatusCode $_
         if ($status -in @(409,412)) {
-            Write-Log 'Another synchronization job currently owns the lock. This run will exit without changes.' 'WARN'
             return $false
         }
         throw
@@ -354,8 +351,8 @@ function Get-State {
     catch {
         $status = Get-ExceptionStatusCode $_
         if ($status -eq 404) {
-            Write-Log 'No state blob exists yet; a baseline synchronization will be performed.'
-            return Get-NewState
+            $script:StateWasNew = $true
+            return (Get-NewState)
         }
         throw
     }
@@ -437,7 +434,8 @@ function Invoke-Graph {
             }
 
             $delay = [Math]::Min([Math]::Pow(2, $attempt), 30)
-            Write-Log "Graph returned HTTP $status; retrying with backoff." 'WARN'
+            $warningStamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+            Write-Warning "[$warningStamp] [WARN] Graph returned HTTP $status; retrying with backoff."
             Renew-StorageLeaseIfNeeded
             Start-Sleep -Seconds $delay
         }
@@ -872,9 +870,12 @@ function Invoke-OneDirection {
 Write-Log "Runbook started in mode '$Mode'."
 Ensure-StateContainer
 
-if (-not (Acquire-StorageLease)) {
+$leaseAcquired = Acquire-StorageLease
+if (-not $leaseAcquired) {
+    Write-Log 'Another synchronization job currently owns the lock. This run will exit without changes.' 'WARN'
     return
 }
+Write-Log 'Acquired distributed synchronization lock.'
 
 try {
     $dzSecret = Get-KeyVaultSecretText -VaultName $KeyVaultName -SecretName $DzidrumsSecretName
@@ -902,6 +903,9 @@ try {
     }
 
     $state = Get-State
+    if ($script:StateWasNew) {
+        Write-Log 'No state blob exists yet; a baseline synchronization will be performed.'
+    }
     $forceBaseline = ($Mode -eq 'Rebaseline')
     if ($forceBaseline) {
         $state.AtoB.DeltaLink = $null
