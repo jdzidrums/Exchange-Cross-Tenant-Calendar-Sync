@@ -79,6 +79,9 @@ foreach ($record in @($output)) {
     if ($record.Type -eq 'Error' -and $record.Value.Exception) {
         Write-Host $record.Value.Exception
     }
+    elseif ($record.Value -is [System.Collections.IDictionary] -and $record.Value.Contains('value')) {
+        Write-Host $record.Value['value']
+    }
     elseif ($null -ne $record.Value -and $record.Value.PSObject.Properties['value']) {
         Write-Host $record.Value.value
     }
