@@ -471,6 +471,38 @@ function New-CalendarViewUri {
     "https://graph.microsoft.com/v1.0/users/$m/calendarView?startDateTime=$s&endDateTime=$e&`$select=$select&`$top=1000"
 }
 
+function Get-ObjectPropertyValue {
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name,
+        [AllowNull()]$Default = $null
+    )
+
+    if ($null -eq $InputObject) { return $Default }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if ($InputObject.Contains($Name)) { return $InputObject[$Name] }
+        return $Default
+    }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $Default
+}
+
+function Get-RequiredObjectPropertyValue {
+    param(
+        [AllowNull()]$InputObject,
+        [Parameter(Mandatory)][string]$Name,
+        [string]$Context = 'Microsoft Graph object'
+    )
+
+    $value = Get-ObjectPropertyValue -InputObject $InputObject -Name $Name
+    if ($null -eq $value -or ($value -is [string] -and [string]::IsNullOrWhiteSpace($value))) {
+        throw "$Context is missing required property '$Name'."
+    }
+    return $value
+}
+
 function Get-EventUri {
     param(
         [Parameter(Mandatory)][string]$Mailbox,
@@ -554,7 +586,7 @@ function Get-MirrorIndex {
             $tx = Get-EventTransactionId -Event $event
             if (-not [string]::IsNullOrWhiteSpace($tx) -and $tx.StartsWith($script:SyncTagPrefix)) {
                 if (-not $index.ContainsKey($tx)) {
-                    $index[$tx] = [string]$event.id
+                    $index[$tx] = [string](Get-RequiredObjectPropertyValue -InputObject $event -Name 'id' -Context 'Calendar event')
                 }
             }
         }
@@ -584,11 +616,7 @@ function Get-EventTransactionId {
     param([Parameter(Mandatory)]$Event)
 
     # Graph omits optional event properties instead of returning them as null.
-    # Access the property bag so StrictMode does not fail on ordinary events
-    # that do not have a client-supplied transactionId.
-    $property = $Event.PSObject.Properties['transactionId']
-    if ($property) { return [string]$property.Value }
-    return ''
+    return [string](Get-ObjectPropertyValue -InputObject $Event -Name 'transactionId' -Default '')
 }
 
 function Test-IsMirrorEvent {
@@ -605,7 +633,11 @@ function Convert-SourceToMirrorPayload {
         [Parameter(Mandatory)][string]$MirrorPrefix
     )
 
-    $private = ([string]$Event.sensitivity -eq 'private')
+    $eventId = [string](Get-ObjectPropertyValue -InputObject $Event -Name 'id' -Default '')
+    $eventContext = if ($eventId) { "Calendar event '$eventId'" } else { 'Calendar event' }
+    $sensitivity = [string](Get-ObjectPropertyValue -InputObject $Event -Name 'sensitivity' -Default 'normal')
+    if ([string]::IsNullOrWhiteSpace($sensitivity)) { $sensitivity = 'normal' }
+    $private = ($sensitivity -eq 'private')
 
     if ($RespectPrivate -and $private) {
         $subject = 'Private - Busy'
@@ -616,26 +648,38 @@ function Convert-SourceToMirrorPayload {
         $location = ''
     }
     else {
-        $subject = "$MirrorPrefix$([string]$Event.subject)"
+        $sourceSubject = [string](Get-ObjectPropertyValue -InputObject $Event -Name 'subject' -Default '')
+        $subject = "$MirrorPrefix$sourceSubject"
         if ([string]::IsNullOrWhiteSpace($subject)) { $subject = "$SourceLabel - Busy" }
-        $location = if ($Event.location -and $Event.location.displayName) { [string]$Event.location.displayName } else { '' }
+        $locationObject = Get-ObjectPropertyValue -InputObject $Event -Name 'location'
+        $location = [string](Get-ObjectPropertyValue -InputObject $locationObject -Name 'displayName' -Default '')
     }
+
+    $startObject = Get-RequiredObjectPropertyValue -InputObject $Event -Name 'start' -Context $eventContext
+    $endObject = Get-RequiredObjectPropertyValue -InputObject $Event -Name 'end' -Context $eventContext
+    $startDateTime = [string](Get-RequiredObjectPropertyValue -InputObject $startObject -Name 'dateTime' -Context "$eventContext start")
+    $startTimeZone = [string](Get-RequiredObjectPropertyValue -InputObject $startObject -Name 'timeZone' -Context "$eventContext start")
+    $endDateTime = [string](Get-RequiredObjectPropertyValue -InputObject $endObject -Name 'dateTime' -Context "$eventContext end")
+    $endTimeZone = [string](Get-RequiredObjectPropertyValue -InputObject $endObject -Name 'timeZone' -Context "$eventContext end")
+    $showAs = [string](Get-ObjectPropertyValue -InputObject $Event -Name 'showAs' -Default 'busy')
+    if ([string]::IsNullOrWhiteSpace($showAs)) { $showAs = 'busy' }
 
     $payload = [ordered]@{
         subject     = $subject
-        start       = [ordered]@{ dateTime = [string]$Event.start.dateTime; timeZone = [string]$Event.start.timeZone }
-        end         = [ordered]@{ dateTime = [string]$Event.end.dateTime; timeZone = [string]$Event.end.timeZone }
-        isAllDay    = [bool]$Event.isAllDay
-        showAs      = if ($Event.showAs) { [string]$Event.showAs } else { 'busy' }
-        sensitivity = if ($Event.sensitivity) { [string]$Event.sensitivity } else { 'normal' }
+        start       = [ordered]@{ dateTime = $startDateTime; timeZone = $startTimeZone }
+        end         = [ordered]@{ dateTime = $endDateTime; timeZone = $endTimeZone }
+        isAllDay    = [bool](Get-ObjectPropertyValue -InputObject $Event -Name 'isAllDay' -Default $false)
+        showAs      = $showAs
+        sensitivity = $sensitivity
         location    = [ordered]@{ displayName = $location }
         isReminderOn = $false
     }
 
     if ($CopyReminders) {
-        $payload.isReminderOn = [bool]$Event.isReminderOn
-        if ($null -ne $Event.reminderMinutesBeforeStart) {
-            $payload.reminderMinutesBeforeStart = [int]$Event.reminderMinutesBeforeStart
+        $payload.isReminderOn = [bool](Get-ObjectPropertyValue -InputObject $Event -Name 'isReminderOn' -Default $false)
+        $reminderMinutes = Get-ObjectPropertyValue -InputObject $Event -Name 'reminderMinutesBeforeStart'
+        if ($null -ne $reminderMinutes) {
+            $payload.reminderMinutesBeforeStart = [int]$reminderMinutes
         }
     }
 
@@ -742,10 +786,10 @@ function Invoke-OneDirection {
 
     foreach ($event in $delta.Items) {
         Renew-StorageLeaseIfNeeded
-        $sourceEventId = [string]$event.id
+        $sourceEventId = [string](Get-ObjectPropertyValue -InputObject $event -Name 'id' -Default '')
         if ([string]::IsNullOrWhiteSpace($sourceEventId)) { continue }
 
-        $isRemoved = $null -ne $event.PSObject.Properties['@removed']
+        $isRemoved = $null -ne (Get-ObjectPropertyValue -InputObject $event -Name '@removed')
         if ($isRemoved) {
             if ($DirectionState.Mappings.ContainsKey($sourceEventId)) {
                 $destinationId = [string]$DirectionState.Mappings[$sourceEventId].DestinationEventId
@@ -763,7 +807,7 @@ function Invoke-OneDirection {
 
         [void]$seenSourceIds.Add($sourceEventId)
 
-        if ([bool]$event.isCancelled) {
+        if ([bool](Get-ObjectPropertyValue -InputObject $event -Name 'isCancelled' -Default $false)) {
             if ($DirectionState.Mappings.ContainsKey($sourceEventId)) {
                 $destinationId = [string]$DirectionState.Mappings[$sourceEventId].DestinationEventId
                 Remove-MirrorEvent -DestinationToken $DestinationToken -DestinationMailbox $DestinationMailbox -DestinationEventId $destinationId
@@ -776,8 +820,10 @@ function Invoke-OneDirection {
         $transactionId = Get-DeterministicTransactionId -SourceMailbox $SourceMailbox -SourceEventId $sourceEventId
         $startUtc = $null
         $endUtc = $null
-        try { $startUtc = ([datetimeoffset]::Parse([string]$event.start.dateTime)).UtcDateTime } catch {}
-        try { $endUtc = ([datetimeoffset]::Parse([string]$event.end.dateTime)).UtcDateTime } catch {}
+        $sourceStart = Get-ObjectPropertyValue -InputObject $event -Name 'start'
+        $sourceEnd = Get-ObjectPropertyValue -InputObject $event -Name 'end'
+        try { $startUtc = ([datetimeoffset]::Parse([string](Get-ObjectPropertyValue -InputObject $sourceStart -Name 'dateTime'))).UtcDateTime } catch {}
+        try { $endUtc = ([datetimeoffset]::Parse([string](Get-ObjectPropertyValue -InputObject $sourceEnd -Name 'dateTime'))).UtcDateTime } catch {}
 
         if (-not $DirectionState.Mappings.ContainsKey($sourceEventId) -and $mirrorIndex.ContainsKey($transactionId)) {
             $DirectionState.Mappings[$sourceEventId] = @{
@@ -811,7 +857,7 @@ function Invoke-OneDirection {
                         -SourceLabel $SourceLabel `
                         -MirrorPrefix $MirrorPrefix `
                         -TransactionId $transactionId
-                    $mapping.DestinationEventId = [string]$created.id
+                    $mapping.DestinationEventId = [string](Get-RequiredObjectPropertyValue -InputObject $created -Name 'id' -Context 'Created mirror event')
                     $createdCount++
                 }
                 else { throw }
@@ -832,7 +878,7 @@ function Invoke-OneDirection {
                 -TransactionId $transactionId
 
             $DirectionState.Mappings[$sourceEventId] = @{
-                DestinationEventId = [string]$created.id
+                DestinationEventId = [string](Get-RequiredObjectPropertyValue -InputObject $created -Name 'id' -Context 'Created mirror event')
                 TransactionId      = $transactionId
                 SourceStartUtc     = if ($startUtc) { $startUtc.ToString('o') } else { $null }
                 SourceEndUtc       = if ($endUtc) { $endUtc.ToString('o') } else { $null }
