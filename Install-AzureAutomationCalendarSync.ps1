@@ -210,12 +210,15 @@ function Connect-CalendarSyncExchange {
         ShowBanner        = $false
         ErrorAction       = 'Stop'
     }
-    if ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
+    if ($connectCommand.Parameters.ContainsKey('Device')) {
+        $params.Device = $true
+    }
+    elseif ($connectCommand.Parameters.ContainsKey('DisableWAM')) {
         $params.DisableWAM = $true
     }
 
     Write-Host "Connecting to Exchange Online for $TenantHint as $AdminUpn..."
-    Connect-ExchangeOnline @params
+    Connect-ExchangeOnline @params | Out-Host
 }
 
 function New-RuntimeApp {
